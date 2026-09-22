@@ -1,0 +1,11 @@
+# Exclude all development files, tests, documentation, and local artifacts from Docker image build
+bin/
+docs/
+test/
+*_test.go
+*.md
+*.test
+*.out
+*.jsonl
+.git/
+.gitignore
