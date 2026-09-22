@@ -1,0 +1,92 @@
+# AI Gateway Configuration
+# Production configuration schema for Layer 1: Core Proxy & Multi-Tenant Authentication
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout_seconds: 15
+  write_timeout_seconds: 60
+  idle_timeout_seconds: 120
+  max_body_bytes: 16777216 # 16 MB
+
+upstreams:
+  # Public SaaS Provider: OpenAI
+  - id: "openai-primary"
+    provider: "openai"
+    endpoint_url: "https://api.openai.com"
+    api_key: "${OPENAI_API_KEY:-sk-mock-openai-key}"
+    timeout_seconds: 30
+
+  # Internal GPU Inference Cluster: vLLM
+  - id: "vllm-local"
+    provider: "vllm"
+    endpoint_url: "http://127.0.0.1:8000"
+    api_key: ""
+    timeout_seconds: 60
+
+routes:
+  # Flagship Frontier Model
+  - alias: "gpt-4o"
+    primary_upstream: "openai-primary"
+    model_name: "gpt-4o"
+
+  # Fast, Cost-Efficient Model
+  - alias: "prod-fast"
+    primary_upstream: "openai-primary"
+    model_name: "gpt-4o-mini"
+
+  # Self-Hosted Open-Weights Model
+  - alias: "internal-llama"
+    primary_upstream: "vllm-local"
+    model_name: "meta-llama/Llama-3.3-70B-Instruct"
+
+tenants:
+  # Production Analytics Tenant
+  - id: "tenant-analytics"
+    name: "Analytics & BI Engineering"
+    tier: "production"
+    api_keys:
+      - "sk-gw-live-analytics-key-4a8f9c"
+      - "sk-gw-backup-analytics-key-2b7e1d"
+    allowed_routes:
+      - "gpt-4o"
+      - "prod-fast"
+      - "internal-llama"
+    rate_limits:
+      requests_per_minute: 600
+      tokens_per_minute: 1000000
+      max_concurrent: 50
+    metadata:
+      cost_center: "CC-4011"
+      department: "Data Platform"
+
+  # Customer Support Automation Tenant
+  - id: "tenant-support"
+    name: "Support Automation Bot"
+    tier: "production"
+    api_keys:
+      - "sk-gw-live-support-key-9f82d1"
+    allowed_routes:
+      - "prod-fast"
+    rate_limits:
+      requests_per_minute: 300
+      tokens_per_minute: 300000
+      max_concurrent: 20
+    metadata:
+      cost_center: "CC-5020"
+      department: "Customer Operations"
+
+  # Internal Developer Sandbox Tenant
+  - id: "tenant-sandbox"
+    name: "Internal Engineering Sandbox"
+    tier: "sandbox"
+    api_keys:
+      - "sk-gw-sandbox-dev-key-77aa33"
+    allowed_routes:
+      - "*"
+    rate_limits:
+      requests_per_minute: 60
+      tokens_per_minute: 100000
+      max_concurrent: 5
+    metadata:
+      environment: "development"
