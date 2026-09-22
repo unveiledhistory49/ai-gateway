@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -74,11 +75,28 @@ func (u *UpstreamConfig) Timeout() time.Duration {
 	return time.Duration(u.TimeoutSeconds) * time.Second
 }
 
-// RouteConfig maps an incoming model alias to a backend upstream and actual model name.
+// RouteConfig maps an incoming model alias to prioritized backend upstreams and model names.
 type RouteConfig struct {
-	Alias           string `yaml:"alias"`
-	PrimaryUpstream string `yaml:"primary_upstream"`
-	ModelName       string `yaml:"model_name"`
+	Alias           string      `yaml:"alias" json:"alias"`
+	Description     string      `yaml:"description,omitempty" json:"description,omitempty"`
+	PrimaryUpstream string      `yaml:"primary_upstream,omitempty" json:"primary_upstream,omitempty"` // Backward compatibility
+	ModelName       string      `yaml:"model_name,omitempty" json:"model_name,omitempty"`             // Backward compatibility
+	Tiers           []RouteTier `yaml:"tiers,omitempty" json:"tiers,omitempty"`
+}
+
+// RouteTier defines a priority tier in the fallback cascade.
+// Priority 0 = Primary, 1 = Fallback, 2 = Emergency.
+type RouteTier struct {
+	Priority int                 `yaml:"priority" json:"priority"`
+	Strategy string              `yaml:"strategy,omitempty" json:"strategy,omitempty"`
+	Targets  []RouteTargetConfig `yaml:"targets" json:"targets"`
+}
+
+// RouteTargetConfig defines an upstream target within a priority tier.
+type RouteTargetConfig struct {
+	UpstreamID string `yaml:"upstream_id" json:"upstream_id"`
+	Model      string `yaml:"model" json:"model"`
+	Weight     int    `yaml:"weight,omitempty" json:"weight,omitempty"`
 }
 
 // TenantConfig defines a tenant identity, allowed routes, API keys, and rate limits.
@@ -236,14 +254,59 @@ func (c *Config) applyDefaultsAndValidate() error {
 		if _, exists := c.routesByAlias[r.Alias]; exists {
 			return fmt.Errorf("duplicate route alias: %s", r.Alias)
 		}
-		if strings.TrimSpace(r.PrimaryUpstream) == "" {
-			return fmt.Errorf("route '%s' has empty primary_upstream", r.Alias)
-		}
-		if _, exists := c.upstreamsByID[r.PrimaryUpstream]; !exists {
-			return fmt.Errorf("route '%s' references unknown primary_upstream '%s'", r.Alias, r.PrimaryUpstream)
-		}
-		if strings.TrimSpace(r.ModelName) == "" {
-			return fmt.Errorf("route '%s' has empty model_name", r.Alias)
+		// Backward compatibility: If no tiers defined, synthesize Tier 0 from primary_upstream
+		if len(r.Tiers) == 0 {
+			if strings.TrimSpace(r.PrimaryUpstream) == "" {
+				return fmt.Errorf("route '%s' has empty primary_upstream", r.Alias)
+			}
+			if _, exists := c.upstreamsByID[r.PrimaryUpstream]; !exists {
+				return fmt.Errorf("route '%s' references unknown primary_upstream '%s'", r.Alias, r.PrimaryUpstream)
+			}
+			if strings.TrimSpace(r.ModelName) == "" {
+				return fmt.Errorf("route '%s' has empty model_name", r.Alias)
+			}
+			r.Tiers = []RouteTier{
+				{
+					Priority: 0,
+					Strategy: "priority",
+					Targets: []RouteTargetConfig{
+						{
+							UpstreamID: r.PrimaryUpstream,
+							Model:      r.ModelName,
+							Weight:     100,
+						},
+					},
+				},
+			}
+		} else {
+			// Validate tiers
+			for _, tier := range r.Tiers {
+				if len(tier.Targets) == 0 {
+					return fmt.Errorf("route '%s' tier %d has no targets", r.Alias, tier.Priority)
+				}
+				for targetIdx, target := range tier.Targets {
+					if strings.TrimSpace(target.UpstreamID) == "" {
+						return fmt.Errorf("route '%s' tier %d target %d has empty upstream_id", r.Alias, tier.Priority, targetIdx)
+					}
+					if _, exists := c.upstreamsByID[target.UpstreamID]; !exists {
+						return fmt.Errorf("route '%s' references unknown upstream '%s'", r.Alias, target.UpstreamID)
+					}
+					if strings.TrimSpace(target.Model) == "" {
+						return fmt.Errorf("route '%s' tier %d target '%s' has empty model", r.Alias, tier.Priority, target.UpstreamID)
+					}
+				}
+			}
+
+			// Sort tiers by priority ascending (0 = Primary, 1 = Fallback, etc.)
+			sort.SliceStable(r.Tiers, func(ti, tj int) bool {
+				return r.Tiers[ti].Priority < r.Tiers[tj].Priority
+			})
+
+			// Populate primary_upstream and model_name for backward compatibility
+			if r.PrimaryUpstream == "" && len(r.Tiers) > 0 && len(r.Tiers[0].Targets) > 0 {
+				r.PrimaryUpstream = r.Tiers[0].Targets[0].UpstreamID
+				r.ModelName = r.Tiers[0].Targets[0].Model
+			}
 		}
 
 		c.routesByAlias[r.Alias] = r

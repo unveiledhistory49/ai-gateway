@@ -288,3 +288,82 @@ tenants:
 		})
 	}
 }
+
+func TestConfigPriorityTiers(t *testing.T) {
+	yamlWithTiers := `
+server:
+  port: 8080
+upstreams:
+  - id: "openai-primary"
+    endpoint_url: "https://api.openai.com"
+  - id: "anthropic-backup"
+    endpoint_url: "https://api.anthropic.com"
+  - id: "vllm-local"
+    endpoint_url: "http://127.0.0.1:8000"
+routes:
+  - alias: "prod-chat"
+    tiers:
+      - priority: 2
+        targets:
+          - upstream_id: "vllm-local"
+            model: "llama-3"
+            weight: 100
+      - priority: 0
+        targets:
+          - upstream_id: "openai-primary"
+            model: "gpt-4o"
+            weight: 80
+      - priority: 1
+        targets:
+          - upstream_id: "anthropic-backup"
+            model: "claude-3-5"
+            weight: 100
+  - alias: "legacy-chat"
+    primary_upstream: "openai-primary"
+    model_name: "gpt-4o-mini"
+tenants:
+  - id: "t-1"
+    api_keys: ["test-key"]
+    allowed_routes: ["prod-chat", "legacy-chat"]
+`
+	cfg, err := ParseConfig(yamlWithTiers)
+	if err != nil {
+		t.Fatalf("unexpected error parsing tiered config: %v", err)
+	}
+
+	// 1. Verify prod-chat tiers were sorted: Tier 0, Tier 1, Tier 2
+	prodRoute, found := cfg.GetRoute("prod-chat")
+	if !found {
+		t.Fatal("route prod-chat not found")
+	}
+	if len(prodRoute.Tiers) != 3 {
+		t.Fatalf("expected 3 tiers, got %d", len(prodRoute.Tiers))
+	}
+	if prodRoute.Tiers[0].Priority != 0 || prodRoute.Tiers[0].Targets[0].UpstreamID != "openai-primary" {
+		t.Fatalf("expected tier 0 to be openai-primary, got %v", prodRoute.Tiers[0])
+	}
+	if prodRoute.Tiers[1].Priority != 1 || prodRoute.Tiers[1].Targets[0].UpstreamID != "anthropic-backup" {
+		t.Fatalf("expected tier 1 to be anthropic-backup, got %v", prodRoute.Tiers[1])
+	}
+	if prodRoute.Tiers[2].Priority != 2 || prodRoute.Tiers[2].Targets[0].UpstreamID != "vllm-local" {
+		t.Fatalf("expected tier 2 to be vllm-local, got %v", prodRoute.Tiers[2])
+	}
+
+	// Backward compatibility field population
+	if prodRoute.PrimaryUpstream != "openai-primary" || prodRoute.ModelName != "gpt-4o" {
+		t.Fatalf("expected backward compat primary_upstream to be populated, got %s, %s", prodRoute.PrimaryUpstream, prodRoute.ModelName)
+	}
+
+	// 2. Verify legacy-chat synthesized Tier 0
+	legacyRoute, found := cfg.GetRoute("legacy-chat")
+	if !found {
+		t.Fatal("route legacy-chat not found")
+	}
+	if len(legacyRoute.Tiers) != 1 {
+		t.Fatalf("expected 1 synthesized tier, got %d", len(legacyRoute.Tiers))
+	}
+	if legacyRoute.Tiers[0].Priority != 0 || legacyRoute.Tiers[0].Targets[0].UpstreamID != "openai-primary" {
+		t.Fatalf("expected synthesized tier 0 for legacy-chat, got %v", legacyRoute.Tiers[0])
+	}
+}
+

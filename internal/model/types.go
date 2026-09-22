@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // TenantContext encapsulates the tenant identity, tier, quotas, and permissions
@@ -148,6 +149,8 @@ const (
 	ErrCodeUpstreamTimeout        = "UPSTREAM_TIMEOUT"
 	ErrCodeInternalError          = "INTERNAL_ERROR"
 	ErrCodeRateLimitExceeded      = "RATE_LIMIT_EXCEEDED"
+	ErrCodeCircuitOpen            = "CIRCUIT_OPEN"
+	ErrCodeAllUpstreamsUnavailable = "ALL_UPSTREAMS_UNAVAILABLE"
 )
 
 // NewGatewayError constructs a new GatewayError.
@@ -193,3 +196,16 @@ type ModelListItem struct {
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
 }
+
+// RouteTarget represents a physical upstream target evaluated in the fallback cascade.
+type RouteTarget struct {
+	UpstreamID   string        `json:"upstream_id"`
+	Provider     string        `json:"provider"`
+	EndpointURL  string        `json:"endpoint_url"`
+	TargetModel  string        `json:"target_model"`
+	APIKey       string        `json:"-"`
+	Timeout      time.Duration `json:"timeout"`
+	PriorityTier int           `json:"priority_tier"`
+	Weight       int           `json:"weight"`
+}
+

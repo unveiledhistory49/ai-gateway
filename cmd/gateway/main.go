@@ -53,7 +53,7 @@ func main() {
 		}
 	}()
 
-	logger.Info("AI Gateway Layer 1 is operational",
+	logger.Info("AI Gateway Layer 2 (SRE Resilience & Health Engine) is operational",
 		"address", fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
 	)
 

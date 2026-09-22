@@ -17,7 +17,14 @@ upstreams:
     api_key: "${OPENAI_API_KEY:-sk-mock-openai-key}"
     timeout_seconds: 30
 
-  # Internal GPU Inference Cluster: vLLM
+  # Public SaaS Provider: Anthropic Fallback
+  - id: "anthropic-backup"
+    provider: "anthropic"
+    endpoint_url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY:-sk-mock-anthropic-key}"
+    timeout_seconds: 30
+
+  # Internal GPU Inference Cluster: vLLM Emergency
   - id: "vllm-local"
     provider: "vllm"
     endpoint_url: "http://127.0.0.1:8000"
@@ -25,12 +32,31 @@ upstreams:
     timeout_seconds: 60
 
 routes:
-  # Flagship Frontier Model
+  # Flagship Frontier Model with Priority Tiers and Fallback Cascades:
+  # Tier 0: Primary (OpenAI) -> Tier 1: Fallback (Anthropic) -> Tier 2: Emergency (vLLM)
   - alias: "gpt-4o"
-    primary_upstream: "openai-primary"
-    model_name: "gpt-4o"
+    description: "Production reasoning with multi-provider fallback cascade"
+    tiers:
+      - priority: 0
+        strategy: "weighted"
+        targets:
+          - upstream_id: "openai-primary"
+            model: "gpt-4o"
+            weight: 100
+      - priority: 1
+        strategy: "priority"
+        targets:
+          - upstream_id: "anthropic-backup"
+            model: "claude-3-5-sonnet-20241022"
+            weight: 100
+      - priority: 2
+        strategy: "emergency"
+        targets:
+          - upstream_id: "vllm-local"
+            model: "meta-llama/Llama-3.3-70B-Instruct"
+            weight: 100
 
-  # Fast, Cost-Efficient Model
+  # Fast, Cost-Efficient Model (demonstrating backward compatibility with primary_upstream)
   - alias: "prod-fast"
     primary_upstream: "openai-primary"
     model_name: "gpt-4o-mini"

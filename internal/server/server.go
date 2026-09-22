@@ -14,16 +14,19 @@ import (
 	"github.com/company/ai-gateway/internal/dispatcher"
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
+	"github.com/company/ai-gateway/internal/resilience"
 	"github.com/company/ai-gateway/internal/router"
 )
 
 // Server encapsulates the HTTP ingress server, routing table, and processing pipeline.
 type Server struct {
-	cfg        *config.Config
-	pipeline   *pipeline.Pipeline
-	authStage  *auth.Stage
-	httpServer *http.Server
-	logger     *slog.Logger
+	cfg           *config.Config
+	pipeline      *pipeline.Pipeline
+	authStage     *auth.Stage
+	registry      *resilience.Registry
+	healthChecker *resilience.HealthChecker
+	httpServer    *http.Server
+	logger        *slog.Logger
 }
 
 // NewServer initializes a new Server using standard production stages.
@@ -32,13 +35,28 @@ func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 		logger = slog.Default()
 	}
 
+	registry := resilience.NewRegistry(resilience.CircuitBreakerConfig{}, logger)
+
+	endpoints := make([]resilience.UpstreamEndpoint, len(cfg.Upstreams))
+	for i, u := range cfg.Upstreams {
+		endpoints[i] = resilience.UpstreamEndpoint{
+			ID:          u.ID,
+			EndpointURL: u.EndpointURL,
+		}
+	}
+
+	healthChecker := resilience.NewHealthChecker(endpoints, registry, resilience.HealthCheckerConfig{}, logger)
+
 	authStage := auth.NewStage(cfg.Tenants, cfg.Server.MaxBodyBytes)
-	routeStage := router.NewStage(cfg)
-	dispStage := dispatcher.NewStage(30 * time.Second)
+	routeStage := router.NewStage(cfg, registry)
+	dispStage := dispatcher.NewStage(30*time.Second, registry)
 
 	pipe := pipeline.NewPipeline(authStage, routeStage, dispStage)
 
-	return NewServerWithPipeline(cfg, pipe, authStage, logger)
+	s := NewServerWithPipeline(cfg, pipe, authStage, logger)
+	s.registry = registry
+	s.healthChecker = healthChecker
+	return s
 }
 
 // NewServerWithPipeline constructs a Server with a custom pipeline (useful for testing).
@@ -71,12 +89,37 @@ func NewServerWithPipeline(cfg *config.Config, pipe *pipeline.Pipeline, authStag
 	return s
 }
 
-// Start runs the HTTP server listener.
+// Registry returns the circuit breaker registry.
+func (s *Server) Registry() *resilience.Registry {
+	return s.registry
+}
+
+// HealthChecker returns the background health checker daemon.
+func (s *Server) HealthChecker() *resilience.HealthChecker {
+	return s.healthChecker
+}
+
+// SetHealthChecker sets a custom health checker on the server.
+func (s *Server) SetHealthChecker(hc *resilience.HealthChecker) {
+	s.healthChecker = hc
+}
+
+// SetRegistry sets a custom circuit breaker registry on the server.
+func (s *Server) SetRegistry(reg *resilience.Registry) {
+	s.registry = reg
+}
+
+// Start runs the HTTP server listener and background daemons.
 func (s *Server) Start() error {
 	s.logger.Info("Starting AI Gateway HTTP Ingress Server",
 		"host", s.cfg.Server.Host,
 		"port", s.cfg.Server.Port,
 	)
+
+	if s.healthChecker != nil {
+		s.healthChecker.Start()
+	}
+
 	if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return fmt.Errorf("HTTP ingress listener error: %w", err)
 	}
@@ -86,6 +129,11 @@ func (s *Server) Start() error {
 // Shutdown gracefully terminates in-flight connections within the provided context deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
 	s.logger.Info("Draining in-flight connections and shutting down HTTP Ingress Server...")
+
+	if s.healthChecker != nil {
+		s.healthChecker.Stop()
+	}
+
 	return s.httpServer.Shutdown(ctx)
 }
 
@@ -147,8 +195,16 @@ func (s *Server) handleLiveness(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleReadiness provides a probe indicating ready status to receive traffic.
+// If all upstreams are failing or circuit breakers are OPEN, returns HTTP 503.
 func (s *Server) handleReadiness(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+
+	if s.healthChecker != nil && !s.healthChecker.IsReady() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"status":"unhealthy","error":"ALL_UPSTREAMS_UNAVAILABLE"}`))
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(`{"status":"ready"}`))
 }

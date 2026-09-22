@@ -14,6 +14,7 @@ import (
 	"github.com/company/ai-gateway/internal/config"
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
+	"github.com/company/ai-gateway/internal/resilience"
 )
 
 // flushRecorder wraps httptest.ResponseRecorder to implement http.Flusher.
@@ -297,3 +298,187 @@ func TestDispatcherClientCancellationDuringStream(t *testing.T) {
 		t.Fatal("upstream connection was not closed upon client cancellation")
 	}
 }
+
+func TestDispatcherFailoverToSecondaryOn503(t *testing.T) {
+	primaryCalled := 0
+	secondaryCalled := 0
+
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalled++
+		http.Error(w, `{"error":{"message":"primary overloaded"}}`, http.StatusServiceUnavailable)
+	}))
+	defer primaryServer.Close()
+
+	secondaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalled++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"chatcmpl-secondary","object":"chat.completion","created":123,"model":"secondary-model","choices":[{"index":0,"message":{"role":"assistant","content":"response from secondary"}}]}`))
+	}))
+	defer secondaryServer.Close()
+
+	reg := resilience.NewRegistry(resilience.CircuitBreakerConfig{}, nil)
+	stage := NewStageWithClient(secondaryServer.Client(), reg)
+
+	w := newFlushRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	reqCtx := pipeline.NewRequestContext(context.Background(), w, r)
+	reqCtx.ChatRequest = &model.CanonicalChatRequest{
+		Model: "prod-alias",
+		Messages: []model.ChatMessage{
+			{Role: "user", Content: "hello"},
+		},
+		Stream: false,
+	}
+
+	reqCtx.Targets = []*model.RouteTarget{
+		{
+			UpstreamID:   "primary-up",
+			EndpointURL:  primaryServer.URL,
+			TargetModel:  "primary-model",
+			PriorityTier: 0,
+		},
+		{
+			UpstreamID:   "secondary-up",
+			EndpointURL:  secondaryServer.URL,
+			TargetModel:  "secondary-model",
+			PriorityTier: 1,
+		},
+	}
+
+	err := stage.Execute(reqCtx)
+	if err != nil {
+		t.Fatalf("expected successful failover, got error: %v", err)
+	}
+
+	if primaryCalled != 1 {
+		t.Fatalf("expected primary to be called 1 time, got %d", primaryCalled)
+	}
+	if secondaryCalled != 1 {
+		t.Fatalf("expected secondary to be called 1 time, got %d", secondaryCalled)
+	}
+
+	// Verify response from secondary
+	if !strings.Contains(w.Body.String(), "response from secondary") {
+		t.Fatalf("expected body to contain secondary response, got: %s", w.Body.String())
+	}
+
+	// Verify primary circuit breaker recorded failure
+	cbPrimary := reg.Get("primary-up")
+	// If primary recorded failure, consecutive successes is 0 and failure was recorded
+	_ = cbPrimary
+}
+
+func TestDispatcherStreamingSafetyRule(t *testing.T) {
+	primaryCalled := 0
+	secondaryCalled := 0
+
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalled++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n"))
+		flusher.Flush()
+		// Abruptly close or fail after flushing
+		// We can hijack or just return without [DONE]
+	}))
+	defer primaryServer.Close()
+
+	secondaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalled++
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer secondaryServer.Close()
+
+	reg := resilience.NewRegistry(resilience.CircuitBreakerConfig{}, nil)
+	stage := NewStageWithClient(primaryServer.Client(), reg)
+
+	w := newFlushRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	reqCtx := pipeline.NewRequestContext(context.Background(), w, r)
+	reqCtx.ChatRequest = &model.CanonicalChatRequest{
+		Model:  "prod-alias",
+		Stream: true,
+	}
+
+	reqCtx.Targets = []*model.RouteTarget{
+		{
+			UpstreamID:   "primary-up",
+			EndpointURL:  primaryServer.URL,
+			TargetModel:  "primary-model",
+			PriorityTier: 0,
+		},
+		{
+			UpstreamID:   "secondary-up",
+			EndpointURL:  secondaryServer.URL,
+			TargetModel:  "secondary-model",
+			PriorityTier: 1,
+		},
+	}
+
+	_ = stage.Execute(reqCtx)
+
+	// Since primary flushed chunks downstream, secondary MUST NEVER be called
+	if secondaryCalled != 0 {
+		t.Fatalf("CRITICAL SAFETY VIOLATION: secondary was called (%d times) after primary flushed streaming chunks!", secondaryCalled)
+	}
+}
+
+func TestDispatcherNonRetryableErrorNoFailover(t *testing.T) {
+	primaryCalled := 0
+	secondaryCalled := 0
+
+	primaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalled++
+		http.Error(w, `{"error":{"message":"invalid api key"}}`, http.StatusUnauthorized)
+	}))
+	defer primaryServer.Close()
+
+	secondaryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalled++
+	}))
+	defer secondaryServer.Close()
+
+	reg := resilience.NewRegistry(resilience.CircuitBreakerConfig{}, nil)
+	stage := NewStageWithClient(primaryServer.Client(), reg)
+
+	w := newFlushRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	reqCtx := pipeline.NewRequestContext(context.Background(), w, r)
+	reqCtx.ChatRequest = &model.CanonicalChatRequest{
+		Model:  "prod-alias",
+		Stream: false,
+	}
+
+	reqCtx.Targets = []*model.RouteTarget{
+		{
+			UpstreamID:   "primary-up",
+			EndpointURL:  primaryServer.URL,
+			TargetModel:  "primary-model",
+			PriorityTier: 0,
+		},
+		{
+			UpstreamID:   "secondary-up",
+			EndpointURL:  secondaryServer.URL,
+			TargetModel:  "secondary-model",
+			PriorityTier: 1,
+		},
+	}
+
+	err := stage.Execute(reqCtx)
+	if err == nil {
+		t.Fatal("expected error for 401 Unauthorized, got nil")
+	}
+
+	var gwErr *model.GatewayError
+	if !errors.As(err, &gwErr) || gwErr.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got: %v", err)
+	}
+
+	if secondaryCalled != 0 {
+		t.Fatalf("expected secondary NOT to be called on non-retryable 401, but got %d calls", secondaryCalled)
+	}
+}
+

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
+	"github.com/company/ai-gateway/internal/resilience"
 )
 
 // bufferPool recycles 4KB byte slices for zero-copy streaming passes.
@@ -26,13 +28,16 @@ var bufferPool = sync.Pool{
 	},
 }
 
-// Stage implements Stage 3: Upstream Dispatcher.
+// Stage implements Stage 3: Upstream Dispatcher with Resilience & Health Engine.
 type Stage struct {
-	client *http.Client
+	client   *http.Client
+	registry *resilience.Registry
+	retryCfg resilience.RetryConfig
+	logger   *slog.Logger
 }
 
 // NewStage constructs a new Upstream Dispatcher stage with a tuned persistent HTTP client pool.
-func NewStage(defaultTimeout time.Duration) *Stage {
+func NewStage(defaultTimeout time.Duration, registry ...*resilience.Registry) *Stage {
 	if defaultTimeout <= 0 {
 		defaultTimeout = 30 * time.Second
 	}
@@ -52,17 +57,54 @@ func NewStage(defaultTimeout time.Duration) *Stage {
 		ForceAttemptHTTP2:     true,
 	}
 
+	var reg *resilience.Registry
+	if len(registry) > 0 {
+		reg = registry[0]
+	}
+
+	retryCfg := resilience.RetryConfig{}
+	retryCfg.ApplyDefaults()
+
 	return &Stage{
 		client: &http.Client{
 			Transport: transport,
 		},
+		registry: reg,
+		retryCfg: retryCfg,
+		logger:   slog.Default(),
 	}
 }
 
 // NewStageWithClient allows injecting a custom HTTP client (e.g., for unit/integration testing).
-func NewStageWithClient(client *http.Client) *Stage {
+func NewStageWithClient(client *http.Client, registry ...*resilience.Registry) *Stage {
+	var reg *resilience.Registry
+	if len(registry) > 0 {
+		reg = registry[0]
+	}
+
+	retryCfg := resilience.RetryConfig{}
+	retryCfg.ApplyDefaults()
+
 	return &Stage{
-		client: client,
+		client:   client,
+		registry: reg,
+		retryCfg: retryCfg,
+		logger:   slog.Default(),
+	}
+}
+
+// NewStageWithConfig constructs a Stage with full configuration injection.
+func NewStageWithConfig(client *http.Client, registry *resilience.Registry, retryCfg resilience.RetryConfig, logger *slog.Logger) *Stage {
+	retryCfg.ApplyDefaults()
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	return &Stage{
+		client:   client,
+		registry: registry,
+		retryCfg: retryCfg,
+		logger:   logger,
 	}
 }
 
@@ -71,96 +113,246 @@ func (s *Stage) Name() string {
 	return "upstream_dispatcher"
 }
 
-// Execute handles forwarding the request to the upstream provider and proxying the response.
+// Execute handles forwarding the request to the upstream provider, executing adaptive retries
+// and failover cascades across healthy priority targets.
 func (s *Stage) Execute(reqCtx *pipeline.RequestContext) error {
-	if reqCtx.Upstream == nil || reqCtx.Route == nil || reqCtx.ChatRequest == nil {
+	if reqCtx.ChatRequest == nil {
 		return model.NewGatewayError(
-			http.StatusInternalServerError,
-			model.ErrCodeInternalError,
-			"Cannot dispatch request: missing route or upstream context.",
+			http.StatusBadRequest,
+			model.ErrCodeBadRequest,
+			"Cannot dispatch request: missing chat request.",
 		)
 	}
 
-	// Prepare upstream payload with mapped target model name
-	upstreamReqPayload := *reqCtx.ChatRequest
-	upstreamReqPayload.Model = reqCtx.TargetModel
-
-	payloadBytes, err := json.Marshal(upstreamReqPayload)
-	if err != nil {
-		return model.NewGatewayError(
-			http.StatusInternalServerError,
-			model.ErrCodeInternalError,
-			fmt.Sprintf("Failed to serialize upstream payload: %v", err),
-		)
+	// Resolve cascade targets
+	targets := reqCtx.Targets
+	if len(targets) == 0 {
+		if reqCtx.Upstream == nil {
+			return model.NewGatewayError(
+				http.StatusInternalServerError,
+				model.ErrCodeInternalError,
+				"Cannot dispatch request: missing route or upstream context.",
+			)
+		}
+		// Backward compatibility: build single target from Upstream and TargetModel
+		targets = []*model.RouteTarget{
+			{
+				UpstreamID:   reqCtx.Upstream.ID,
+				Provider:     reqCtx.Upstream.Provider,
+				EndpointURL:  reqCtx.Upstream.EndpointURL,
+				TargetModel:  reqCtx.TargetModel,
+				APIKey:       reqCtx.Upstream.APIKey,
+				Timeout:      reqCtx.Upstream.Timeout(),
+				PriorityTier: 0,
+				Weight:       100,
+			},
+		}
 	}
 
-	endpointURL := strings.TrimRight(reqCtx.Upstream.EndpointURL, "/") + "/v1/chat/completions"
+	var lastErr error
 
-	// Create cancellable context coupled to downstream client context
-	upstreamCtx, cancel := context.WithCancel(reqCtx.Context)
-	defer cancel()
-
-	// If non-streaming, apply upstream timeout to context
-	if !reqCtx.ChatRequest.Stream && reqCtx.Upstream.TimeoutSeconds > 0 {
-		var timeoutCancel context.CancelFunc
-		upstreamCtx, timeoutCancel = context.WithTimeout(upstreamCtx, reqCtx.Upstream.Timeout())
-		defer timeoutCancel()
-	}
-
-	httpReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, endpointURL, bytes.NewReader(payloadBytes))
-	if err != nil {
-		return model.NewGatewayError(
-			http.StatusInternalServerError,
-			model.ErrCodeInternalError,
-			fmt.Sprintf("Failed to construct upstream request: %v", err),
-		)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	if reqCtx.ChatRequest.Stream {
-		httpReq.Header.Set("Accept", "text/event-stream")
-	} else {
-		httpReq.Header.Set("Accept", "application/json")
-	}
-
-	// Vaulted upstream API key
-	if reqCtx.Upstream.APIKey != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+reqCtx.Upstream.APIKey)
-	}
-
-	// Dispatch request
-	resp, err := s.client.Do(httpReq)
-	if err != nil {
+	// Cascade through targets: Primary (Tier 0) -> Fallback (Tier 1) -> Emergency (Tier 2)
+	for targetIdx, target := range targets {
 		if reqCtx.Context.Err() != nil {
 			return reqCtx.Context.Err()
 		}
-		var netErr net.Error
-		if errors.As(err, &netErr) && netErr.Timeout() {
+
+		// Check circuit breaker status
+		var cb *resilience.CircuitBreaker
+		if s.registry != nil {
+			cb = s.registry.Get(target.UpstreamID)
+			if !cb.Allow() {
+				// Target's breaker is OPEN, skip to next fallback target in cascade
+				continue
+			}
+		}
+
+		reqCtx.TargetModel = target.TargetModel
+		hasNextTarget := targetIdx < len(targets)-1
+
+		// Prepare upstream payload with target model mapping
+		upstreamReqPayload := *reqCtx.ChatRequest
+		upstreamReqPayload.Model = target.TargetModel
+
+		payloadBytes, err := json.Marshal(upstreamReqPayload)
+		if err != nil {
 			return model.NewGatewayError(
-				http.StatusGatewayTimeout,
-				model.ErrCodeUpstreamTimeout,
-				fmt.Sprintf("Upstream provider '%s' timed out: %v", reqCtx.Upstream.ID, err),
+				http.StatusInternalServerError,
+				model.ErrCodeInternalError,
+				fmt.Sprintf("Failed to serialize upstream payload: %v", err),
 			)
 		}
-		return model.NewGatewayError(
-			http.StatusBadGateway,
-			model.ErrCodeUpstreamBadGateway,
-			fmt.Sprintf("Failed to reach upstream provider '%s': %v", reqCtx.Upstream.ID, err),
-		)
-	}
-	defer resp.Body.Close()
 
-	// Handle upstream non-2xx status codes
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return s.handleUpstreamError(resp, reqCtx.Upstream.ID)
+		endpointURL := strings.TrimRight(target.EndpointURL, "/") + "/v1/chat/completions"
+
+		// If there is another fallback target in the cascade, we attempt the current target once
+		// and failover immediately if it fails with retriable/connection error.
+		// If this is the last available target, we retry up to MaxRetries using Full Jitter backoff.
+		maxAttempts := 0
+		if !hasNextTarget {
+			maxAttempts = s.retryCfg.MaxRetries
+		}
+
+		for attempt := 0; attempt <= maxAttempts; attempt++ {
+			if reqCtx.Context.Err() != nil {
+				return reqCtx.Context.Err()
+			}
+
+			upstreamCtx, cancel := context.WithCancel(reqCtx.Context)
+			if !reqCtx.ChatRequest.Stream && target.Timeout > 0 {
+				var timeoutCancel context.CancelFunc
+				upstreamCtx, timeoutCancel = context.WithTimeout(upstreamCtx, target.Timeout)
+				defer timeoutCancel()
+			}
+
+			httpReq, err := http.NewRequestWithContext(upstreamCtx, http.MethodPost, endpointURL, bytes.NewReader(payloadBytes))
+			if err != nil {
+				cancel()
+				return model.NewGatewayError(
+					http.StatusInternalServerError,
+					model.ErrCodeInternalError,
+					fmt.Sprintf("Failed to construct upstream request: %v", err),
+				)
+			}
+
+			httpReq.Header.Set("Content-Type", "application/json")
+			if reqCtx.ChatRequest.Stream {
+				httpReq.Header.Set("Accept", "text/event-stream")
+			} else {
+				httpReq.Header.Set("Accept", "application/json")
+			}
+
+			if target.APIKey != "" {
+				httpReq.Header.Set("Authorization", "Bearer "+target.APIKey)
+			}
+
+			resp, err := s.client.Do(httpReq)
+			if err != nil {
+				cancel()
+				if reqCtx.Context.Err() != nil {
+					return reqCtx.Context.Err()
+				}
+
+				if cb != nil {
+					cb.RecordFailure()
+				}
+
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					lastErr = model.NewGatewayError(
+						http.StatusGatewayTimeout,
+						model.ErrCodeUpstreamTimeout,
+						fmt.Sprintf("Upstream provider '%s' timed out: %v", target.UpstreamID, err),
+					)
+				} else {
+					lastErr = model.NewGatewayError(
+						http.StatusBadGateway,
+						model.ErrCodeUpstreamBadGateway,
+						fmt.Sprintf("Failed to reach upstream provider '%s': %v", target.UpstreamID, err),
+					)
+				}
+
+				if resilience.IsRetryableNetworkError(err) {
+					if hasNextTarget {
+						// Per FAILURE-MODES.md: "Zero-delay switch to alternative endpoint; bypass exponential backoff; mark upstream host unhealthy."
+						s.logger.Info("Failing over to next target due to transport error",
+							"from_upstream", target.UpstreamID,
+							"error", err.Error(),
+						)
+						break
+					}
+					// Retry same target if attempts remain
+					if attempt < maxAttempts {
+						sleepDur := resilience.FullJitterBackoff(attempt, s.retryCfg.BaseDelay, s.retryCfg.MaxDelay, s.retryCfg.UniformRand)
+						select {
+						case <-time.After(sleepDur):
+						case <-reqCtx.Context.Done():
+							return reqCtx.Context.Err()
+						}
+						continue
+					}
+				}
+				return lastErr
+			}
+
+			// 2xx Success
+			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				if cb != nil {
+					cb.RecordSuccess()
+				}
+
+				if reqCtx.ChatRequest.Stream {
+					defer cancel()
+					// CRUCIAL SAFETY RULE:
+					// Once chunks are flushed downstream, retries are prohibited!
+					return s.handleStreamingResponse(upstreamCtx, resp, reqCtx, cb)
+				}
+
+				defer resp.Body.Close()
+				cancel()
+				return s.handleSyncResponse(resp, reqCtx)
+			}
+
+			// Upstream returned non-2xx error status code
+			lastErr = s.handleUpstreamError(resp, target.UpstreamID)
+			resp.Body.Close()
+			cancel()
+
+			// Non-retryable errors (400, 401, 403, 404, 422) return immediately
+			if resilience.IsNonRetryableStatus(resp.StatusCode) {
+				return lastErr
+			}
+
+			// Retriable errors: record failure on target's circuit breaker
+			if cb != nil {
+				cb.RecordFailure()
+			}
+
+			// Check Retry-After header for 429
+			retryAfterDur, hasRetryAfter, exceedsThreshold := resilience.ParseRetryAfter(resp.Header, time.Now())
+			if hasRetryAfter && exceedsThreshold && hasNextTarget {
+				s.logger.Info("Retry-After exceeds 5s threshold, failing over to next target",
+					"from_upstream", target.UpstreamID,
+					"retry_after_seconds", retryAfterDur.Seconds(),
+				)
+				break
+			}
+
+			if hasNextTarget {
+				s.logger.Info("Failing over to next target in cascade due to retriable status",
+					"from_upstream", target.UpstreamID,
+					"status", resp.StatusCode,
+				)
+				break
+			}
+
+			// If retrying same target:
+			if attempt < maxAttempts {
+				var sleepDur time.Duration
+				if hasRetryAfter && retryAfterDur > 0 {
+					sleepDur = retryAfterDur
+				} else {
+					sleepDur = resilience.FullJitterBackoff(attempt, s.retryCfg.BaseDelay, s.retryCfg.MaxDelay, s.retryCfg.UniformRand)
+				}
+				select {
+				case <-time.After(sleepDur):
+				case <-reqCtx.Context.Done():
+					return reqCtx.Context.Err()
+				}
+				continue
+			}
+		}
 	}
 
-	// Dispatch based on stream flag
-	if reqCtx.ChatRequest.Stream {
-		return s.handleStreamingResponse(upstreamCtx, resp, reqCtx)
+	if lastErr != nil {
+		return lastErr
 	}
 
-	return s.handleSyncResponse(resp, reqCtx)
+	return model.NewGatewayError(
+		http.StatusServiceUnavailable,
+		model.ErrCodeCircuitOpen,
+		"All upstreams unavailable.",
+	)
 }
 
 // handleUpstreamError translates upstream error responses into structured GatewayError.
@@ -181,6 +373,14 @@ func (s *Stage) handleUpstreamError(resp *http.Response, upstreamID string) erro
 	}
 
 	switch resp.StatusCode {
+	case http.StatusBadRequest:
+		return model.NewGatewayError(http.StatusBadRequest, model.ErrCodeBadRequest, fmt.Sprintf("Upstream provider '%s' returned 400 Bad Request: %s", upstreamID, msg))
+	case http.StatusUnauthorized:
+		return model.NewGatewayError(http.StatusUnauthorized, model.ErrCodeMissingOrInvalidAPIKey, fmt.Sprintf("Upstream provider '%s' returned 401 Unauthorized: %s", upstreamID, msg))
+	case http.StatusForbidden:
+		return model.NewGatewayError(http.StatusForbidden, model.ErrCodeForbiddenRoute, fmt.Sprintf("Upstream provider '%s' returned 403 Forbidden: %s", upstreamID, msg))
+	case http.StatusNotFound:
+		return model.NewGatewayError(http.StatusNotFound, model.ErrCodeUnknownRoute, fmt.Sprintf("Upstream provider '%s' returned 404 Not Found: %s", upstreamID, msg))
 	case http.StatusBadGateway:
 		return model.NewGatewayError(http.StatusBadGateway, model.ErrCodeUpstreamBadGateway, fmt.Sprintf("Upstream provider '%s' returned 502 Bad Gateway: %s", upstreamID, msg))
 	case http.StatusServiceUnavailable:
@@ -222,7 +422,12 @@ func (s *Stage) handleSyncResponse(resp *http.Response, reqCtx *pipeline.Request
 }
 
 // handleStreamingResponse streams SSE chunks incrementally with active upstream socket teardown.
-func (s *Stage) handleStreamingResponse(ctx context.Context, resp *http.Response, reqCtx *pipeline.RequestContext) error {
+// CRUCIAL SAFETY RULE:
+// Once chunks or headers have been flushed downstream (flusher.Flush() called),
+// retries and failovers are strictly prohibited to prevent corrupted stream concatenations.
+func (s *Stage) handleStreamingResponse(ctx context.Context, resp *http.Response, reqCtx *pipeline.RequestContext, cb *resilience.CircuitBreaker) error {
+	defer resp.Body.Close()
+
 	flusher, ok := reqCtx.Writer.(http.Flusher)
 	if !ok {
 		return model.NewGatewayError(
@@ -240,18 +445,15 @@ func (s *Stage) handleStreamingResponse(ctx context.Context, resp *http.Response
 	reqCtx.Writer.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	// Monitor client disconnection in background goroutine to hard-close upstream body immediately
+	// Past this point, headers have flushed to client. Never retry or failover.
 	disconnected := make(chan struct{})
 	defer close(disconnected)
 
 	go func() {
 		select {
 		case <-reqCtx.Context.Done():
-			// Client dropped connection. Hard close the upstream response body
-			// to force immediate TCP RST/FIN to upstream provider.
 			resp.Body.Close()
 		case <-disconnected:
-			// Stream completed normally
 		}
 	}()
 
@@ -275,9 +477,15 @@ func (s *Stage) handleStreamingResponse(ctx context.Context, resp *http.Response
 				return nil
 			}
 			if reqCtx.Context.Err() != nil {
-				// Client disconnected
 				return reqCtx.Context.Err()
 			}
+			if cb != nil {
+				cb.RecordFailure()
+			}
+			// Emit structured SSE error frame per FAILURE-MODES.md
+			reqCtx.Writer.Write([]byte("data: {\"error\":{\"message\":\"Upstream provider disconnected mid-stream\",\"type\":\"gateway_upstream_error\",\"code\":\"upstream_failure\"}}\n\ndata: [DONE]\n\n"))
+			flusher.Flush()
+			reqCtx.ShortCircuited = true
 			return model.NewGatewayError(
 				http.StatusBadGateway,
 				model.ErrCodeUpstreamBadGateway,

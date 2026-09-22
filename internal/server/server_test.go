@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/company/ai-gateway/internal/config"
@@ -141,3 +142,27 @@ func TestListModelsFilteredByTenant(t *testing.T) {
 		t.Fatalf("expected all 3 models for admin, got %d", len(adminListResp.Data))
 	}
 }
+
+func TestReadinessWhenUpstreamsDown(t *testing.T) {
+	srv := setupTestServer(t)
+
+	// Trip the circuit breaker for up-mock
+	cb := srv.Registry().Get("up-mock")
+	// Set min requests to 1 and record failure
+	cb.Reset()
+	for i := 0; i < 20; i++ {
+		cb.RecordFailure()
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz/readiness", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 Service Unavailable when breaker is open, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "ALL_UPSTREAMS_UNAVAILABLE") {
+		t.Fatalf("expected error message to contain ALL_UPSTREAMS_UNAVAILABLE, got: %s", rec.Body.String())
+	}
+}
+

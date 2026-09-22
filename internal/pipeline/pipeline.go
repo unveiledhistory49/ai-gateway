@@ -26,6 +26,7 @@ type RequestContext struct {
 	Route       *config.RouteConfig
 	Upstream    *config.UpstreamConfig
 	TargetModel string
+	Targets     []*model.RouteTarget
 
 	// Observability & stage timing
 	StartTime      time.Time
