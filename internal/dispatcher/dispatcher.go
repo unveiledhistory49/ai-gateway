@@ -17,6 +17,7 @@ import (
 
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
+	"github.com/company/ai-gateway/internal/policy"
 	"github.com/company/ai-gateway/internal/resilience"
 )
 
@@ -413,15 +414,29 @@ func (s *Stage) handleSyncResponse(resp *http.Response, reqCtx *pipeline.Request
 		reqCtx.ChatResponse = &chatResp
 	}
 
+	if reqCtx.SkipSyncWrite {
+		// Response delivery and token reconciliation deferred to PostPolicyStage
+		return nil
+	}
+
+	// Direct write when SkipSyncWrite is false (e.g., isolated dispatcher unit tests)
 	reqCtx.Writer.Header().Set("Content-Type", "application/json")
 	reqCtx.Writer.WriteHeader(resp.StatusCode)
 	reqCtx.Writer.Write(bodyBytes)
+
+	// Reconcile tokens if callback present
+	if reqCtx.ChatResponse != nil && reqCtx.ChatResponse.Usage != nil {
+		reqCtx.ExecuteReconcile(reqCtx.ChatResponse.Usage.TotalTokens)
+	} else {
+		reqCtx.ExecuteReconcile(0)
+	}
 
 	reqCtx.ShortCircuited = true
 	return nil
 }
 
-// handleStreamingResponse streams SSE chunks incrementally with active upstream socket teardown.
+// handleStreamingResponse streams SSE chunks incrementally with active upstream socket teardown
+// and streaming lookahead buffer for DLP policy enforcement.
 // CRUCIAL SAFETY RULE:
 // Once chunks or headers have been flushed downstream (flusher.Flush() called),
 // retries and failovers are strictly prohibited to prevent corrupted stream concatenations.
@@ -457,22 +472,158 @@ func (s *Stage) handleStreamingResponse(ctx context.Context, resp *http.Response
 		}
 	}()
 
+	var streamScanner *policy.StreamScanner
+	if len(reqCtx.Policies) > 0 {
+		streamScanner = policy.NewStreamScanner(reqCtx.Policies)
+	}
+
 	reader := bufio.NewReader(resp.Body)
+	var totalTokensCounted int
+
 	for {
 		line, err := reader.ReadBytes('\n')
 		if len(line) > 0 {
-			if _, writeErr := reqCtx.Writer.Write(line); writeErr != nil {
-				return writeErr
-			}
-			// Flush on empty line delimiter between SSE frames
-			if bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n")) {
-				flusher.Flush()
+			if streamScanner != nil {
+				trimmed := bytes.TrimSpace(line)
+				if bytes.HasPrefix(trimmed, []byte("data: ")) {
+					payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+					if bytes.Equal(payload, []byte("[DONE]")) {
+						// Stream completed
+						tail, scanErr := streamScanner.Finish()
+						if scanErr != nil {
+							var violErr *policy.ErrStreamPolicyViolation
+							ruleName := "POLICY_VIOLATION"
+							if errors.As(scanErr, &violErr) {
+								ruleName = violErr.Policy
+							}
+							resp.Body.Close()
+							reqCtx.Writer.Write([]byte(fmt.Sprintf("event: error\ndata: {\"error\":{\"code\":\"POLICY_VIOLATION\",\"message\":\"Stream terminated due to policy violation\",\"rule\":%q}}\n\n", ruleName)))
+							flusher.Flush()
+							reqCtx.ExecuteReconcile(0)
+							reqCtx.ShortCircuited = true
+							return model.NewGatewayError(http.StatusBadRequest, model.ErrCodePolicyViolation, scanErr.Error())
+						}
+
+						if len(tail) > 0 {
+							chunkJSON, _ := json.Marshal(model.StreamChunk{
+								Object: "chat.completion.chunk",
+								Choices: []model.StreamChoice{
+									{Index: 0, Delta: model.StreamChoiceDelta{Content: tail}},
+								},
+							})
+							reqCtx.Writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(chunkJSON))))
+							flusher.Flush()
+						}
+
+						reqCtx.Writer.Write([]byte("data: [DONE]\n\n"))
+						flusher.Flush()
+						reqCtx.ExecuteReconcile(totalTokensCounted)
+						reqCtx.ShortCircuited = true
+						return nil
+					}
+
+					var chunk model.StreamChunk
+					if jsonErr := json.Unmarshal(payload, &chunk); jsonErr == nil {
+						if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+							totalTokensCounted = chunk.Usage.TotalTokens
+						}
+						var deltaContent string
+						if len(chunk.Choices) > 0 {
+							deltaContent = chunk.Choices[0].Delta.Content
+						}
+						if deltaContent != "" {
+							emitted, scanErr := streamScanner.Feed(deltaContent)
+							if scanErr != nil {
+								var violErr *policy.ErrStreamPolicyViolation
+								ruleName := "POLICY_VIOLATION"
+								if errors.As(scanErr, &violErr) {
+									ruleName = violErr.Policy
+								}
+								resp.Body.Close()
+								reqCtx.Writer.Write([]byte(fmt.Sprintf("event: error\ndata: {\"error\":{\"code\":\"POLICY_VIOLATION\",\"message\":\"Stream terminated due to policy violation\",\"rule\":%q}}\n\n", ruleName)))
+								flusher.Flush()
+								reqCtx.ExecuteReconcile(0)
+								reqCtx.ShortCircuited = true
+								return model.NewGatewayError(http.StatusBadRequest, model.ErrCodePolicyViolation, scanErr.Error())
+							}
+							if len(emitted) > 0 {
+								chunk.Choices[0].Delta.Content = emitted
+								chunkBytes, _ := json.Marshal(chunk)
+								reqCtx.Writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(chunkBytes))))
+								flusher.Flush()
+							}
+						} else if len(chunk.Choices) > 0 && (chunk.Choices[0].Delta.Role != "" || chunk.Choices[0].FinishReason != nil) {
+							chunkBytes, _ := json.Marshal(chunk)
+							reqCtx.Writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(chunkBytes))))
+							flusher.Flush()
+						}
+					} else {
+						// Non-json data payload
+						emitted, scanErr := streamScanner.Feed(string(payload))
+						if scanErr != nil {
+							resp.Body.Close()
+							reqCtx.Writer.Write([]byte("event: error\ndata: {\"error\":{\"code\":\"POLICY_VIOLATION\"}}\n\n"))
+							flusher.Flush()
+							reqCtx.ExecuteReconcile(0)
+							reqCtx.ShortCircuited = true
+							return model.NewGatewayError(http.StatusBadRequest, model.ErrCodePolicyViolation, scanErr.Error())
+						}
+						if len(emitted) > 0 {
+							reqCtx.Writer.Write([]byte(fmt.Sprintf("data: %s\n\n", emitted)))
+							flusher.Flush()
+						}
+					}
+				}
+			} else {
+				// No policies active: stream directly through
+				trimmed := bytes.TrimSpace(line)
+				if bytes.HasPrefix(trimmed, []byte("data: ")) {
+					payload := bytes.TrimPrefix(trimmed, []byte("data: "))
+					var chunk model.StreamChunk
+					if jsonErr := json.Unmarshal(payload, &chunk); jsonErr == nil && chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
+						totalTokensCounted = chunk.Usage.TotalTokens
+					}
+				}
+
+				if _, writeErr := reqCtx.Writer.Write(line); writeErr != nil {
+					return writeErr
+				}
+				if bytes.Equal(line, []byte("\n")) || bytes.Equal(line, []byte("\r\n")) {
+					flusher.Flush()
+				}
 			}
 		}
 
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				if streamScanner != nil {
+					tail, scanErr := streamScanner.Finish()
+					if scanErr != nil {
+						var violErr *policy.ErrStreamPolicyViolation
+						ruleName := "POLICY_VIOLATION"
+						if errors.As(scanErr, &violErr) {
+							ruleName = violErr.Policy
+						}
+						resp.Body.Close()
+						reqCtx.Writer.Write([]byte(fmt.Sprintf("event: error\ndata: {\"error\":{\"code\":\"POLICY_VIOLATION\",\"message\":\"Stream terminated due to policy violation\",\"rule\":%q}}\n\n", ruleName)))
+						flusher.Flush()
+						reqCtx.ExecuteReconcile(0)
+						reqCtx.ShortCircuited = true
+						return model.NewGatewayError(http.StatusBadRequest, model.ErrCodePolicyViolation, scanErr.Error())
+					}
+					if len(tail) > 0 {
+						chunkJSON, _ := json.Marshal(model.StreamChunk{
+							Object: "chat.completion.chunk",
+							Choices: []model.StreamChoice{
+								{Index: 0, Delta: model.StreamChoiceDelta{Content: tail}},
+							},
+						})
+						reqCtx.Writer.Write([]byte(fmt.Sprintf("data: %s\n\n", string(chunkJSON))))
+						flusher.Flush()
+					}
+				}
 				flusher.Flush()
+				reqCtx.ExecuteReconcile(totalTokensCounted)
 				reqCtx.ShortCircuited = true
 				return nil
 			}
@@ -485,6 +636,7 @@ func (s *Stage) handleStreamingResponse(ctx context.Context, resp *http.Response
 			// Emit structured SSE error frame per FAILURE-MODES.md
 			reqCtx.Writer.Write([]byte("data: {\"error\":{\"message\":\"Upstream provider disconnected mid-stream\",\"type\":\"gateway_upstream_error\",\"code\":\"upstream_failure\"}}\n\ndata: [DONE]\n\n"))
 			flusher.Flush()
+			reqCtx.ExecuteReconcile(0)
 			reqCtx.ShortCircuited = true
 			return model.NewGatewayError(
 				http.StatusBadGateway,

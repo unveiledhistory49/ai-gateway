@@ -9,12 +9,13 @@ import (
 // TenantContext encapsulates the tenant identity, tier, quotas, and permissions
 // resolved during authentication.
 type TenantContext struct {
-	ID            string            `json:"id" yaml:"id"`
-	Name          string            `json:"name" yaml:"name"`
-	Tier          string            `json:"tier" yaml:"tier"`
-	AllowedRoutes []string          `json:"allowed_routes" yaml:"allowed_routes"`
-	RateLimits    RateLimits        `json:"rate_limits,omitempty" yaml:"rate_limits,omitempty"`
-	Metadata      map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
+	ID             string            `json:"id" yaml:"id"`
+	Name           string            `json:"name" yaml:"name"`
+	Tier           string            `json:"tier" yaml:"tier"`
+	AllowedRoutes  []string          `json:"allowed_routes" yaml:"allowed_routes"`
+	RateLimits     RateLimits        `json:"rate_limits,omitempty" yaml:"rate_limits,omitempty"`
+	PolicyBindings []string          `json:"policy_bindings,omitempty" yaml:"policy_bindings,omitempty"`
+	Metadata       map[string]string `json:"metadata,omitempty" yaml:"metadata,omitempty"`
 }
 
 // RateLimits specifies request, token, and concurrency limits for a tenant.
@@ -139,17 +140,19 @@ type ErrorResponse struct {
 
 // Standard machine-readable error codes.
 const (
-	ErrCodeMissingOrInvalidAPIKey = "MISSING_OR_INVALID_API_KEY"
-	ErrCodeForbiddenRoute         = "FORBIDDEN_ROUTE"
-	ErrCodeUnknownRoute           = "UNKNOWN_ROUTE"
-	ErrCodeBadRequest             = "BAD_REQUEST"
-	ErrCodeMissingModel           = "MISSING_MODEL"
-	ErrCodeUpstreamUnavailable    = "UPSTREAM_UNAVAILABLE"
-	ErrCodeUpstreamBadGateway     = "UPSTREAM_BAD_GATEWAY"
-	ErrCodeUpstreamTimeout        = "UPSTREAM_TIMEOUT"
-	ErrCodeInternalError          = "INTERNAL_ERROR"
-	ErrCodeRateLimitExceeded      = "RATE_LIMIT_EXCEEDED"
-	ErrCodeCircuitOpen            = "CIRCUIT_OPEN"
+	ErrCodeMissingOrInvalidAPIKey  = "MISSING_OR_INVALID_API_KEY"
+	ErrCodeForbiddenRoute          = "FORBIDDEN_ROUTE"
+	ErrCodeUnknownRoute            = "UNKNOWN_ROUTE"
+	ErrCodeBadRequest              = "BAD_REQUEST"
+	ErrCodeMissingModel            = "MISSING_MODEL"
+	ErrCodeUpstreamUnavailable     = "UPSTREAM_UNAVAILABLE"
+	ErrCodeUpstreamBadGateway      = "UPSTREAM_BAD_GATEWAY"
+	ErrCodeUpstreamTimeout         = "UPSTREAM_TIMEOUT"
+	ErrCodeInternalError           = "INTERNAL_ERROR"
+	ErrCodeRateLimitExceeded       = "RATE_LIMIT_EXCEEDED"
+	ErrCodeConcurrencyLimitExceeded = "CONCURRENCY_LIMIT_EXCEEDED"
+	ErrCodePolicyViolation         = "POLICY_VIOLATION"
+	ErrCodeCircuitOpen             = "CIRCUIT_OPEN"
 	ErrCodeAllUpstreamsUnavailable = "ALL_UPSTREAMS_UNAVAILABLE"
 )
 

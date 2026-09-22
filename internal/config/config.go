@@ -30,10 +30,12 @@ type Config struct {
 	Upstreams []UpstreamConfig `yaml:"upstreams"`
 	Routes    []RouteConfig    `yaml:"routes"`
 	Tenants   []TenantConfig   `yaml:"tenants"`
+	Policies  []PolicyConfig   `yaml:"policies,omitempty"`
 
 	// Fast lookup indices populated after validation
 	upstreamsByID map[string]*UpstreamConfig
 	routesByAlias map[string]*RouteConfig
+	policiesByID  map[string]*PolicyConfig
 }
 
 // ServerConfig defines the ingress listener and connection timeouts.
@@ -99,26 +101,46 @@ type RouteTargetConfig struct {
 	Weight     int    `yaml:"weight,omitempty" json:"weight,omitempty"`
 }
 
+// PolicyConfig defines a DLP policy with action and pattern/rule definitions.
+type PolicyConfig struct {
+	ID          string   `yaml:"id" json:"id"`
+	Name        string   `yaml:"name,omitempty" json:"name,omitempty"`
+	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
+	Action      string   `yaml:"action" json:"action"` // "BLOCK" or "MASK" / "REDACT"
+	Patterns    []string `yaml:"patterns,omitempty" json:"patterns,omitempty"`
+	Rules       []string `yaml:"rules,omitempty" json:"rules,omitempty"`
+}
+
+// AllPatterns returns the consolidated list of patterns and rules for the policy.
+func (p *PolicyConfig) AllPatterns() []string {
+	var pats []string
+	pats = append(pats, p.Patterns...)
+	pats = append(pats, p.Rules...)
+	return pats
+}
+
 // TenantConfig defines a tenant identity, allowed routes, API keys, and rate limits.
 type TenantConfig struct {
-	ID            string            `yaml:"id"`
-	Name          string            `yaml:"name"`
-	Tier          string            `yaml:"tier"`
-	APIKeys       []string          `yaml:"api_keys"`
-	AllowedRoutes []string          `yaml:"allowed_routes"`
-	RateLimits    model.RateLimits  `yaml:"rate_limits"`
-	Metadata      map[string]string `yaml:"metadata"`
+	ID             string            `yaml:"id"`
+	Name           string            `yaml:"name"`
+	Tier           string            `yaml:"tier"`
+	APIKeys        []string          `yaml:"api_keys"`
+	AllowedRoutes  []string          `yaml:"allowed_routes"`
+	RateLimits     model.RateLimits  `yaml:"rate_limits"`
+	PolicyBindings []string          `yaml:"policy_bindings,omitempty"`
+	Metadata       map[string]string `yaml:"metadata"`
 }
 
 // ToTenantContext converts TenantConfig to model.TenantContext.
 func (t *TenantConfig) ToTenantContext() *model.TenantContext {
 	return &model.TenantContext{
-		ID:            t.ID,
-		Name:          t.Name,
-		Tier:          t.Tier,
-		AllowedRoutes: append([]string(nil), t.AllowedRoutes...),
-		RateLimits:    t.RateLimits,
-		Metadata:      t.Metadata,
+		ID:             t.ID,
+		Name:           t.Name,
+		Tier:           t.Tier,
+		AllowedRoutes:  append([]string(nil), t.AllowedRoutes...),
+		RateLimits:     t.RateLimits,
+		PolicyBindings: append([]string(nil), t.PolicyBindings...),
+		Metadata:       t.Metadata,
 	}
 }
 
@@ -357,6 +379,50 @@ func (c *Config) applyDefaultsAndValidate() error {
 				return fmt.Errorf("tenant '%s' references unconfigured allowed_route '%s'", t.ID, route)
 			}
 		}
+
+		// Validate policy bindings
+		for _, pb := range t.PolicyBindings {
+			trimmed := strings.TrimSpace(pb)
+			if trimmed == "" {
+				return fmt.Errorf("tenant '%s' contains empty policy_binding", t.ID)
+			}
+		}
+	}
+
+	// Policies validation
+	c.policiesByID = make(map[string]*PolicyConfig, len(c.Policies))
+	for i := range c.Policies {
+		p := &c.Policies[i]
+		if strings.TrimSpace(p.ID) == "" {
+			return fmt.Errorf("policy index %d has empty id", i)
+		}
+		if _, exists := c.policiesByID[p.ID]; exists {
+			return fmt.Errorf("duplicate policy id: %s", p.ID)
+		}
+		action := strings.ToUpper(strings.TrimSpace(p.Action))
+		if action != "BLOCK" && action != "MASK" && action != "REDACT" {
+			return fmt.Errorf("policy '%s' has invalid action '%s': must be BLOCK, MASK, or REDACT", p.ID, p.Action)
+		}
+		if action == "REDACT" {
+			action = "MASK"
+		}
+		p.Action = action
+
+		if len(p.AllPatterns()) == 0 {
+			return fmt.Errorf("policy '%s' has no patterns or rules configured", p.ID)
+		}
+
+		c.policiesByID[p.ID] = p
+	}
+
+	// Verify tenant policy bindings after policiesByID is fully built
+	for _, t := range c.Tenants {
+		for _, pb := range t.PolicyBindings {
+			trimmed := strings.TrimSpace(pb)
+			if _, exists := c.policiesByID[trimmed]; !exists {
+				return fmt.Errorf("tenant '%s' references unconfigured policy '%s'", t.ID, trimmed)
+			}
+		}
 	}
 
 	return nil
@@ -379,4 +445,17 @@ func (c *Config) ListRoutes() []RouteConfig {
 	routes := make([]RouteConfig, len(c.Routes))
 	copy(routes, c.Routes)
 	return routes
+}
+
+// GetPolicy retrieves PolicyConfig by ID.
+func (c *Config) GetPolicy(id string) (*PolicyConfig, bool) {
+	p, ok := c.policiesByID[id]
+	return p, ok
+}
+
+// ListPolicies returns all configured PolicyConfig items.
+func (c *Config) ListPolicies() []PolicyConfig {
+	policies := make([]PolicyConfig, len(c.Policies))
+	copy(policies, c.Policies)
+	return policies
 }

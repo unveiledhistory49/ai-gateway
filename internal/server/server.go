@@ -12,8 +12,10 @@ import (
 	"github.com/company/ai-gateway/internal/auth"
 	"github.com/company/ai-gateway/internal/config"
 	"github.com/company/ai-gateway/internal/dispatcher"
+	"github.com/company/ai-gateway/internal/limiter"
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
+	"github.com/company/ai-gateway/internal/policy"
 	"github.com/company/ai-gateway/internal/resilience"
 	"github.com/company/ai-gateway/internal/router"
 )
@@ -25,6 +27,8 @@ type Server struct {
 	authStage     *auth.Stage
 	registry      *resilience.Registry
 	healthChecker *resilience.HealthChecker
+	limiter       *limiter.Limiter
+	policyEngine  *policy.Engine
 	httpServer    *http.Server
 	logger        *slog.Logger
 }
@@ -47,15 +51,23 @@ func NewServer(cfg *config.Config, logger *slog.Logger) *Server {
 
 	healthChecker := resilience.NewHealthChecker(endpoints, registry, resilience.HealthCheckerConfig{}, logger)
 
-	authStage := auth.NewStage(cfg.Tenants, cfg.Server.MaxBodyBytes)
-	routeStage := router.NewStage(cfg, registry)
-	dispStage := dispatcher.NewStage(30*time.Second, registry)
+	limiterInstance := limiter.NewLimiter()
+	policyEngine := policy.NewEngine()
 
-	pipe := pipeline.NewPipeline(authStage, routeStage, dispStage)
+	authStage := auth.NewStage(cfg.Tenants, cfg.Server.MaxBodyBytes)
+	quotaStage := limiter.NewQuotaStage(limiterInstance)
+	routeStage := router.NewStage(cfg, registry)
+	prePolicyStage := policy.NewPrePolicyStage(policyEngine, cfg)
+	dispStage := dispatcher.NewStage(30*time.Second, registry)
+	postPolicyStage := policy.NewPostPolicyStage(policyEngine)
+
+	pipe := pipeline.NewPipeline(authStage, quotaStage, routeStage, prePolicyStage, dispStage, postPolicyStage)
 
 	s := NewServerWithPipeline(cfg, pipe, authStage, logger)
 	s.registry = registry
 	s.healthChecker = healthChecker
+	s.limiter = limiterInstance
+	s.policyEngine = policyEngine
 	return s
 }
 
@@ -137,6 +149,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
+// Limiter returns the in-memory rate limiter instance.
+func (s *Server) Limiter() *limiter.Limiter {
+	return s.limiter
+}
+
+// PolicyEngine returns the policy engine instance.
+func (s *Server) PolicyEngine() *policy.Engine {
+	return s.policyEngine
+}
+
 // Handler exposes the internal http.Handler for testing purposes.
 func (s *Server) Handler() http.Handler {
 	return s.httpServer.Handler
@@ -145,6 +167,8 @@ func (s *Server) Handler() http.Handler {
 // handleChatCompletions processes inbound OpenAI-compatible chat completion requests.
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	reqCtx := pipeline.NewRequestContext(r.Context(), w, r)
+	reqCtx.SkipSyncWrite = s.pipeline != nil && s.pipeline.HasStage("post_policy")
+	defer reqCtx.ExecuteReconcile(0)
 
 	err := s.pipeline.Execute(reqCtx)
 	if err != nil {

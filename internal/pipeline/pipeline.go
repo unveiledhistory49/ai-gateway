@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/company/ai-gateway/internal/config"
@@ -27,14 +28,29 @@ type RequestContext struct {
 	Upstream    *config.UpstreamConfig
 	TargetModel string
 	Targets     []*model.RouteTarget
+	Policies    []*config.PolicyConfig
 
 	// Observability & stage timing
 	StartTime      time.Time
 	StageDurations map[string]time.Duration
 	Metadata       map[string]any
 
+	// Rate Limiting & Two-Phase Token Reservation
+	Reconcile      func(actualTokens int)
+	reconcileOnce  sync.Once
+
 	// Control flags
 	ShortCircuited bool
+	SkipSyncWrite  bool
+}
+
+// ExecuteReconcile executes the deferred reconciliation callback exactly once.
+func (r *RequestContext) ExecuteReconcile(actualTokens int) {
+	r.reconcileOnce.Do(func() {
+		if r.Reconcile != nil {
+			r.Reconcile(actualTokens)
+		}
+	})
 }
 
 // NewRequestContext initializes a RequestContext for an incoming HTTP request.
@@ -70,6 +86,16 @@ func NewPipeline(stages ...Stage) *Pipeline {
 // Stages returns a slice of the configured stages in order.
 func (p *Pipeline) Stages() []Stage {
 	return append([]Stage(nil), p.stages...)
+}
+
+// HasStage reports whether a stage with the given name is present in the pipeline.
+func (p *Pipeline) HasStage(name string) bool {
+	for _, stage := range p.stages {
+		if stage.Name() == name {
+			return true
+		}
+	}
+	return false
 }
 
 // Execute runs all stages sequentially.

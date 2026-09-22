@@ -66,6 +66,34 @@ routes:
     primary_upstream: "vllm-local"
     model_name: "meta-llama/Llama-3.3-70B-Instruct"
 
+# Deterministic Data Loss Prevention (DLP) Policies
+policies:
+  # PCI-DSS Credit Card Guard: Blocks any raw credit card numbers
+  - id: "pci-credit-card-guard"
+    name: "PCI DSS Credit Card Exfiltration Guard"
+    description: "Detects Visa, MasterCard, Amex PAN numbers with Luhn checksum verification"
+    action: "BLOCK"
+    patterns:
+      - "credit_card"
+
+  # Secret & Key Leakage Guard: Blocks AWS keys, private keys, and high-entropy strings
+  - id: "secrets-leakage-guard"
+    name: "Cryptographic Secrets & API Key Guard"
+    description: "Detects AWS Secret Access Keys, PEM Private Key headers, and high-entropy secrets"
+    action: "BLOCK"
+    patterns:
+      - "aws_key"
+      - "private_key"
+      - "high_entropy"
+
+  # PII Masking: Redacts US Social Security Numbers in flight
+  - id: "pii-ssn-masking"
+    name: "PII SSN Redaction Policy"
+    description: "Masks US Social Security Numbers with [REDACTED:pii-ssn-masking]"
+    action: "MASK"
+    patterns:
+      - "ssn"
+
 tenants:
   # Production Analytics Tenant
   - id: "tenant-analytics"
@@ -82,6 +110,10 @@ tenants:
       requests_per_minute: 600
       tokens_per_minute: 1000000
       max_concurrent: 50
+    policy_bindings:
+      - "pci-credit-card-guard"
+      - "secrets-leakage-guard"
+      - "pii-ssn-masking"
     metadata:
       cost_center: "CC-4011"
       department: "Data Platform"
@@ -98,6 +130,9 @@ tenants:
       requests_per_minute: 300
       tokens_per_minute: 300000
       max_concurrent: 20
+    policy_bindings:
+      - "pci-credit-card-guard"
+      - "pii-ssn-masking"
     metadata:
       cost_center: "CC-5020"
       department: "Customer Operations"
@@ -114,5 +149,8 @@ tenants:
       requests_per_minute: 60
       tokens_per_minute: 100000
       max_concurrent: 5
+    policy_bindings:
+      - "secrets-leakage-guard"
     metadata:
       environment: "development"
+

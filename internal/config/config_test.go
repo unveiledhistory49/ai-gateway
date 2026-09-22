@@ -367,3 +367,95 @@ tenants:
 	}
 }
 
+func TestConfigPolicies(t *testing.T) {
+	yamlWithPolicies := `
+server:
+  port: 8080
+upstreams:
+  - id: "up-1"
+    endpoint_url: "https://api.openai.com"
+routes:
+  - alias: "m-1"
+    primary_upstream: "up-1"
+    model_name: "m-1"
+policies:
+  - id: "pci-dlp"
+    name: "PCI DSS Guard"
+    action: "BLOCK"
+    patterns:
+      - "credit_card"
+  - id: "pii-mask"
+    name: "PII Masking"
+    action: "MASK"
+    rules:
+      - "ssn"
+tenants:
+  - id: "t-1"
+    api_keys: ["key-1"]
+    allowed_routes: ["m-1"]
+    policy_bindings:
+      - "pci-dlp"
+      - "pii-mask"
+`
+	cfg, err := ParseConfig(yamlWithPolicies)
+	if err != nil {
+		t.Fatalf("unexpected error parsing config with policies: %v", err)
+	}
+
+	if len(cfg.Policies) != 2 {
+		t.Fatalf("expected 2 policies, got %d", len(cfg.Policies))
+	}
+	p1, ok := cfg.GetPolicy("pci-dlp")
+	if !ok || p1.Action != "BLOCK" || len(p1.Patterns) != 1 || p1.Patterns[0] != "credit_card" {
+		t.Fatalf("unexpected policy pci-dlp: %+v", p1)
+	}
+	p2, ok := cfg.GetPolicy("pii-mask")
+	if !ok || p2.Action != "MASK" || len(p2.Rules) != 1 || p2.Rules[0] != "ssn" {
+		t.Fatalf("unexpected policy pii-mask: %+v", p2)
+	}
+
+	t1 := cfg.Tenants[0].ToTenantContext()
+	if len(t1.PolicyBindings) != 2 || t1.PolicyBindings[0] != "pci-dlp" || t1.PolicyBindings[1] != "pii-mask" {
+		t.Fatalf("unexpected tenant policy bindings: %v", t1.PolicyBindings)
+	}
+
+	// Error case: duplicate policy id
+	duplicatePolicyYAML := strings.Replace(yamlWithPolicies, `id: "pii-mask"`, `id: "pci-dlp"`, 1)
+	if _, err := ParseConfig(duplicatePolicyYAML); err == nil || !strings.Contains(err.Error(), "duplicate policy id") {
+		t.Fatalf("expected duplicate policy id error, got: %v", err)
+	}
+
+	// Error case: invalid action
+	invalidActionYAML := strings.Replace(yamlWithPolicies, `action: "BLOCK"`, `action: "DESTROY"`, 1)
+	if _, err := ParseConfig(invalidActionYAML); err == nil || !strings.Contains(err.Error(), "invalid action") {
+		t.Fatalf("expected invalid action error, got: %v", err)
+	}
+
+	// Error case: empty patterns
+	emptyPatternsYAML := strings.Replace(yamlWithPolicies, `- "credit_card"`, ``, 1)
+	if _, err := ParseConfig(emptyPatternsYAML); err == nil || !strings.Contains(err.Error(), "no patterns or rules") {
+		t.Fatalf("expected no patterns or rules error, got: %v", err)
+	}
+
+	// Error case: tenant references unknown policy
+	unknownPolicyYAML := strings.Replace(yamlWithPolicies, `- "pci-dlp"`, `- "non-existent-policy"`, 1)
+	if _, err := ParseConfig(unknownPolicyYAML); err == nil || !strings.Contains(err.Error(), "references unconfigured policy") {
+		t.Fatalf("expected unconfigured policy error, got: %v", err)
+	}
+}
+
+func TestLoadConfigExampleFile(t *testing.T) {
+	cfg, err := LoadConfig("../../config.example.yaml")
+	if err != nil {
+		t.Fatalf("failed to load config.example.yaml: %v", err)
+	}
+	if len(cfg.Policies) == 0 {
+		t.Fatal("expected policies in config.example.yaml")
+	}
+	if len(cfg.Tenants) == 0 {
+		t.Fatal("expected tenants in config.example.yaml")
+	}
+}
+
+
+
