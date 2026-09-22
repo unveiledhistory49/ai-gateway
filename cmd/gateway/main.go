@@ -53,8 +53,9 @@ func main() {
 		}
 	}()
 
-	logger.Info("AI Gateway Layer 2 (SRE Resilience & Health Engine) is operational",
+	logger.Info("AI Gateway Layer 4 (Observability, Security Hardening & Audit) is operational",
 		"address", fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
+		"metrics", fmt.Sprintf("http://%s:%d/metrics", cfg.Server.Host, cfg.Server.Port),
 	)
 
 	// Block until signal or fatal server error

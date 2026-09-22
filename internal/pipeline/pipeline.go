@@ -35,6 +35,22 @@ type RequestContext struct {
 	StageDurations map[string]time.Duration
 	Metadata       map[string]any
 
+	// Distributed Tracing & Correlation (W3C Trace Context)
+	RequestID string
+	TraceID   string
+	SpanID    string
+
+	// Upstream & Execution Telemetry
+	UpstreamID       string
+	UpstreamModel    string
+	UpstreamDuration time.Duration
+
+	// Policy & Audit Attributes
+	PromptHash   string
+	ResponseHash string
+	PolicyAction string
+	DLPViolated  string
+
 	// Rate Limiting & Two-Phase Token Reservation
 	Reconcile      func(actualTokens int)
 	reconcileOnce  sync.Once

@@ -5,14 +5,16 @@ import (
 	"net/http"
 
 	"github.com/company/ai-gateway/internal/config"
+	"github.com/company/ai-gateway/internal/metrics"
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
 )
 
 // PrePolicyStage scans incoming user prompts against bound policies before route dispatch.
 type PrePolicyStage struct {
-	engine *Engine
-	cfg    *config.Config
+	engine  *Engine
+	cfg     *config.Config
+	metrics *metrics.Metrics
 }
 
 // NewPrePolicyStage constructs a new PrePolicyStage.
@@ -25,9 +27,15 @@ func NewPrePolicyStage(engine *Engine, cfg ...*config.Config) *PrePolicyStage {
 		c = cfg[0]
 	}
 	return &PrePolicyStage{
-		engine: engine,
-		cfg:    c,
+		engine:  engine,
+		cfg:     c,
+		metrics: metrics.Default(),
 	}
+}
+
+// SetMetrics updates the metrics collector for PrePolicyStage.
+func (p *PrePolicyStage) SetMetrics(m *metrics.Metrics) {
+	p.metrics = m
 }
 
 // Name returns the identifier of this stage.
@@ -71,6 +79,16 @@ func (p *PrePolicyStage) Execute(reqCtx *pipeline.RequestContext) error {
 		}
 
 		if res.Violated {
+			reqCtx.PolicyAction = res.Action
+			reqCtx.DLPViolated = res.ViolatedPolicy
+			tenantID := "unknown"
+			if reqCtx.Tenant != nil && reqCtx.Tenant.ID != "" {
+				tenantID = reqCtx.Tenant.ID
+			}
+			if p.metrics != nil {
+				p.metrics.RecordPolicyViolation(tenantID, res.ViolatedPolicy, res.Action)
+			}
+
 			if res.Action == "BLOCK" {
 				return model.NewGatewayError(
 					http.StatusBadRequest,

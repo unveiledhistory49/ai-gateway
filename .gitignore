@@ -11,7 +11,5 @@ bin/
 *.out
 cover.out
 
-# IDE and OS files
-.DS_Store
-.idea/
-.vscode/
+# Runtime audit logs
+*.jsonl

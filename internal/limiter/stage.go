@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/company/ai-gateway/internal/metrics"
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
 )
@@ -13,16 +14,29 @@ import (
 // QuotaStage implements Stage 2: Token-Bucket & Quota Rate Limiting.
 type QuotaStage struct {
 	limiter *Limiter
+	metrics *metrics.Metrics
 }
 
 // NewQuotaStage constructs a new QuotaStage.
-func NewQuotaStage(limiter *Limiter) *QuotaStage {
+func NewQuotaStage(limiter *Limiter, m ...*metrics.Metrics) *QuotaStage {
 	if limiter == nil {
 		limiter = NewLimiter()
 	}
+	var met *metrics.Metrics
+	if len(m) > 0 && m[0] != nil {
+		met = m[0]
+	} else {
+		met = metrics.Default()
+	}
 	return &QuotaStage{
 		limiter: limiter,
+		metrics: met,
 	}
+}
+
+// SetMetrics updates the metrics engine for QuotaStage.
+func (q *QuotaStage) SetMetrics(m *metrics.Metrics) {
+	q.metrics = m
 }
 
 // Name returns the identifier of this stage.
@@ -66,8 +80,20 @@ func (q *QuotaStage) Execute(reqCtx *pipeline.RequestContext) error {
 			reqCtx.Writer.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 		}
 		var gwErr *model.GatewayError
+		limitType := "rpm"
 		if ok := isGatewayError(err, &gwErr); ok {
+			if gwErr.Code == model.ErrCodeConcurrencyLimitExceeded {
+				limitType = "concurrency"
+			} else if strings.Contains(gwErr.Message, "tokens per minute") {
+				limitType = "tpm"
+			}
+			if q.metrics != nil {
+				q.metrics.RecordRateLimitRejection(reqCtx.Tenant.ID, limitType)
+			}
 			return gwErr
+		}
+		if q.metrics != nil {
+			q.metrics.RecordRateLimitRejection(reqCtx.Tenant.ID, limitType)
 		}
 		return model.NewGatewayError(
 			http.StatusTooManyRequests,

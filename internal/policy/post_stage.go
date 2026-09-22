@@ -5,13 +5,15 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/company/ai-gateway/internal/metrics"
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
 )
 
 // PostPolicyStage scans non-streaming completion responses before delivery to downstream caller.
 type PostPolicyStage struct {
-	engine *Engine
+	engine  *Engine
+	metrics *metrics.Metrics
 }
 
 // NewPostPolicyStage constructs a new PostPolicyStage.
@@ -20,8 +22,14 @@ func NewPostPolicyStage(engine *Engine) *PostPolicyStage {
 		engine = NewEngine()
 	}
 	return &PostPolicyStage{
-		engine: engine,
+		engine:  engine,
+		metrics: metrics.Default(),
 	}
+}
+
+// SetMetrics updates the metrics engine for PostPolicyStage.
+func (p *PostPolicyStage) SetMetrics(m *metrics.Metrics) {
+	p.metrics = m
 }
 
 // Name returns the identifier of this stage.
@@ -54,6 +62,16 @@ func (p *PostPolicyStage) Execute(reqCtx *pipeline.RequestContext) error {
 			}
 
 			if res.Violated {
+				reqCtx.PolicyAction = res.Action
+				reqCtx.DLPViolated = res.ViolatedPolicy
+				tenantID := "unknown"
+				if reqCtx.Tenant != nil && reqCtx.Tenant.ID != "" {
+					tenantID = reqCtx.Tenant.ID
+				}
+				if p.metrics != nil {
+					p.metrics.RecordPolicyViolation(tenantID, res.ViolatedPolicy, res.Action)
+				}
+
 				if res.Action == "BLOCK" {
 					// Discard reservation upon violation abort
 					reqCtx.ExecuteReconcile(0)

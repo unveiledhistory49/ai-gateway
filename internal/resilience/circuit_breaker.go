@@ -27,6 +27,9 @@ const (
 	DefaultMaxCanaryProbes      = 1                // 1 concurrent canary request in half-open
 )
 
+// StateChangeCallback is invoked whenever a circuit breaker transitions between states.
+type StateChangeCallback func(upstream string, from, to State)
+
 // CircuitBreakerConfig defines tuning parameters for a CircuitBreaker instance.
 type CircuitBreakerConfig struct {
 	FailureRateThreshold float64
@@ -38,6 +41,7 @@ type CircuitBreakerConfig struct {
 	SuccessThreshold     int
 	MaxCanaryProbes      int
 	NowFunc              func() time.Time
+	OnStateChange        StateChangeCallback
 }
 
 // ApplyDefaults fills in zero-value fields with production defaults.
@@ -92,6 +96,7 @@ type CircuitBreaker struct {
 	openUntil            time.Time
 	consecutiveSuccesses int
 	activeCanaries       int
+	onStateChange        StateChangeCallback
 }
 
 // NewCircuitBreaker initializes a new CircuitBreaker for an upstream target.
@@ -101,14 +106,19 @@ func NewCircuitBreaker(name string, cfg CircuitBreakerConfig, logger *slog.Logge
 		logger = slog.Default()
 	}
 
-	return &CircuitBreaker{
+	cb := &CircuitBreaker{
 		name:            name,
 		config:          cfg,
 		logger:          logger,
 		state:           StateClosed,
 		buckets:         make([]bucket, cfg.NumBuckets),
 		currentCooldown: cfg.Cooldown,
+		onStateChange:   cfg.OnStateChange,
 	}
+	if cb.onStateChange != nil {
+		cb.onStateChange(name, "", StateClosed)
+	}
+	return cb
 }
 
 // Name returns the identifier of the upstream target.
@@ -176,10 +186,14 @@ func (cb *CircuitBreaker) RecordSuccess() {
 				"new_state", string(StateClosed),
 				"consecutive_successes", cb.consecutiveSuccesses,
 			)
+			fromState := cb.state
 			cb.state = StateClosed
 			cb.consecutiveSuccesses = 0
 			cb.currentCooldown = cb.config.Cooldown
 			cb.clearBucketsLocked()
+			if cb.onStateChange != nil {
+				cb.onStateChange(cb.name, fromState, StateClosed)
+			}
 		}
 
 	case StateOpen:
@@ -209,7 +223,11 @@ func (cb *CircuitBreaker) RecordFailure() {
 				"failures", failures,
 				"cooldown_seconds", cb.currentCooldown.Seconds(),
 			)
+			fromState := cb.state
 			cb.state = StateOpen
+			if cb.onStateChange != nil {
+				cb.onStateChange(cb.name, fromState, StateOpen)
+			}
 		}
 
 	case StateHalfOpen:
@@ -232,7 +250,11 @@ func (cb *CircuitBreaker) RecordFailure() {
 			"new_state", string(StateOpen),
 			"cooldown_seconds", cb.currentCooldown.Seconds(),
 		)
+		fromState := cb.state
 		cb.state = StateOpen
+		if cb.onStateChange != nil {
+			cb.onStateChange(cb.name, fromState, StateOpen)
+		}
 
 	case StateOpen:
 		// Already OPEN
@@ -244,11 +266,15 @@ func (cb *CircuitBreaker) Reset() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	fromState := cb.state
 	cb.state = StateClosed
 	cb.consecutiveSuccesses = 0
 	cb.activeCanaries = 0
 	cb.currentCooldown = cb.config.Cooldown
 	cb.clearBucketsLocked()
+	if fromState != StateClosed && cb.onStateChange != nil {
+		cb.onStateChange(cb.name, fromState, StateClosed)
+	}
 }
 
 // checkOpenToHalfOpenLocked checks if cooldown elapsed in OPEN state and transitions to HALF_OPEN.
@@ -265,9 +291,13 @@ func (cb *CircuitBreaker) checkOpenToHalfOpenLocked() {
 			"new_state", string(StateHalfOpen),
 			"cooldown_elapsed", cb.currentCooldown.Seconds(),
 		)
+		fromState := cb.state
 		cb.state = StateHalfOpen
 		cb.consecutiveSuccesses = 0
 		cb.activeCanaries = 0
+		if cb.onStateChange != nil {
+			cb.onStateChange(cb.name, fromState, StateHalfOpen)
+		}
 	}
 }
 
@@ -322,12 +352,23 @@ func (cb *CircuitBreaker) clearBucketsLocked() {
 	}
 }
 
+// SetOnStateChange sets or updates the state transition callback.
+func (cb *CircuitBreaker) SetOnStateChange(fn StateChangeCallback) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.onStateChange = fn
+	if fn != nil {
+		fn(cb.name, "", cb.state)
+	}
+}
+
 // Registry manages circuit breaker instances per upstream target.
 type Registry struct {
-	mu        sync.RWMutex
-	breakers  map[string]*CircuitBreaker
-	defaultCfg CircuitBreakerConfig
-	logger    *slog.Logger
+	mu            sync.RWMutex
+	breakers      map[string]*CircuitBreaker
+	defaultCfg    CircuitBreakerConfig
+	logger        *slog.Logger
+	onStateChange StateChangeCallback
 }
 
 // NewRegistry initializes a circuit breaker registry.
@@ -338,9 +379,29 @@ func NewRegistry(defaultCfg CircuitBreakerConfig, logger *slog.Logger) *Registry
 	}
 
 	return &Registry{
-		breakers:   make(map[string]*CircuitBreaker),
-		defaultCfg: defaultCfg,
-		logger:     logger,
+		breakers:      make(map[string]*CircuitBreaker),
+		defaultCfg:    defaultCfg,
+		logger:        logger,
+		onStateChange: defaultCfg.OnStateChange,
+	}
+}
+
+// SetStateChangeCallback assigns a callback for circuit breaker state transitions
+// and immediately initializes all currently registered breakers.
+func (r *Registry) SetStateChangeCallback(cb StateChangeCallback) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.onStateChange = cb
+	r.defaultCfg.OnStateChange = cb
+	for name, b := range r.breakers {
+		b.mu.Lock()
+		b.onStateChange = cb
+		currentState := b.state
+		b.mu.Unlock()
+		if cb != nil {
+			cb(name, "", currentState)
+		}
 	}
 }
 
@@ -361,7 +422,9 @@ func (r *Registry) Get(upstreamID string) *CircuitBreaker {
 		return cb
 	}
 
-	cb = NewCircuitBreaker(upstreamID, r.defaultCfg, r.logger)
+	cfg := r.defaultCfg
+	cfg.OnStateChange = r.onStateChange
+	cb = NewCircuitBreaker(upstreamID, cfg, r.logger)
 	r.breakers[upstreamID] = cb
 	return cb
 }
@@ -382,5 +445,8 @@ func (r *Registry) GetAll() map[string]*CircuitBreaker {
 func (r *Registry) Register(upstreamID string, cb *CircuitBreaker) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.onStateChange != nil {
+		cb.SetOnStateChange(r.onStateChange)
+	}
 	r.breakers[upstreamID] = cb
 }

@@ -11,14 +11,17 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/company/ai-gateway/internal/metrics"
 	"github.com/company/ai-gateway/internal/model"
 	"github.com/company/ai-gateway/internal/pipeline"
 	"github.com/company/ai-gateway/internal/policy"
 	"github.com/company/ai-gateway/internal/resilience"
+	"github.com/company/ai-gateway/internal/tracing"
 )
 
 // bufferPool recycles 4KB byte slices for zero-copy streaming passes.
@@ -35,6 +38,7 @@ type Stage struct {
 	registry *resilience.Registry
 	retryCfg resilience.RetryConfig
 	logger   *slog.Logger
+	metrics  *metrics.Metrics
 }
 
 // NewStage constructs a new Upstream Dispatcher stage with a tuned persistent HTTP client pool.
@@ -73,6 +77,7 @@ func NewStage(defaultTimeout time.Duration, registry ...*resilience.Registry) *S
 		registry: reg,
 		retryCfg: retryCfg,
 		logger:   slog.Default(),
+		metrics:  metrics.Default(),
 	}
 }
 
@@ -91,6 +96,7 @@ func NewStageWithClient(client *http.Client, registry ...*resilience.Registry) *
 		registry: reg,
 		retryCfg: retryCfg,
 		logger:   slog.Default(),
+		metrics:  metrics.Default(),
 	}
 }
 
@@ -106,7 +112,13 @@ func NewStageWithConfig(client *http.Client, registry *resilience.Registry, retr
 		registry: registry,
 		retryCfg: retryCfg,
 		logger:   logger,
+		metrics:  metrics.Default(),
 	}
+}
+
+// SetMetrics updates the metrics engine for Stage.
+func (s *Stage) SetMetrics(m *metrics.Metrics) {
+	s.metrics = m
 }
 
 // Name returns the identifier of this stage.
@@ -227,7 +239,29 @@ func (s *Stage) Execute(reqCtx *pipeline.RequestContext) error {
 				httpReq.Header.Set("Authorization", "Bearer "+target.APIKey)
 			}
 
+			// Distributed Tracing: inject traceparent and X-Request-ID
+			if reqCtx.TraceID != "" {
+				childSpanID := tracing.NewSpanID()
+				httpReq.Header.Set(tracing.TraceparentHeader, tracing.FormatTraceparent(reqCtx.TraceID, childSpanID))
+			}
+			if reqCtx.RequestID != "" {
+				httpReq.Header.Set(tracing.RequestIDHeader, reqCtx.RequestID)
+			}
+
+			reqCtx.UpstreamID = target.UpstreamID
+			reqCtx.UpstreamModel = target.TargetModel
+			upstreamStart := time.Now()
 			resp, err := s.client.Do(httpReq)
+			callDuration := time.Since(upstreamStart)
+			reqCtx.UpstreamDuration += callDuration
+
+			statusCodeStr := "0"
+			if resp != nil {
+				statusCodeStr = strconv.Itoa(resp.StatusCode)
+			}
+			if s.metrics != nil {
+				s.metrics.RecordUpstream(target.UpstreamID, target.TargetModel, statusCodeStr, callDuration.Seconds())
+			}
 			if err != nil {
 				cancel()
 				if reqCtx.Context.Err() != nil {
