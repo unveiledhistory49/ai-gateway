@@ -5,37 +5,35 @@
 [![Tests](https://img.shields.io/badge/Tests-74%20Passing-brightgreen.svg)]()
 [![Binary Size](https://img.shields.io/badge/Binary-8.4MB%20(Static)-success.svg)]()
 
-> **"AI proposes. Deterministic systems enforce. Boring, reliable infrastructure."**
+**AI Gateway** is a high-performance reverse proxy and control plane positioned between your applications and Large Language Model (LLM) providers (OpenAI, Anthropic, Google Vertex AI, Azure OpenAI, NVIDIA NIM, and self-hosted vLLM/Triton clusters).
 
-**AI Gateway** is a high-performance, production-ready control plane positioned between your applications and Large Language Model (LLM) providers (OpenAI, Anthropic, Google Vertex AI, Azure OpenAI, and self-hosted vLLM/Triton clusters).
-
-Designed as a drop-in replacement for OpenAI API endpoints, it delivers unified multi-provider routing, deterministic data security (DLP/PII masking), token quota enforcement, circuit-breaking resilience, and cryptographic auditability without sacrificing streaming latency ($p_{99} < 15\text{ms}$ gateway overhead).
+Designed as a drop-in replacement for OpenAI API endpoints, it delivers unified multi-provider routing, data loss prevention (DLP/PII masking), token quota enforcement, circuit-breaking resilience, and cryptographic auditability without sacrificing streaming latency ($p_{99} < 15\text{ms}$ gateway overhead).
 
 ---
 
 ## The 5 Real-World Problems It Solves
 
-Directly connecting applications and agents to LLM APIs creates operational fragility, security exposure, and unchecked cloud spend. AI Gateway provides a unified control plane solving five core operational challenges:
+Connecting applications directly to third-party LLM APIs creates operational fragility, security exposure, and unchecked cloud spend. AI Gateway provides a unified control plane solving five core operational challenges:
 
 ### 1. Instant Failover During Provider Outages (Reliability & SRE)
-- **Without Gateway**: OpenAI or Anthropic suffers a 503 outage or 429 rate limit $\to$ Your application crashes, your users get error screens, and revenue stops.
-- **With Gateway**: The gateway's sliding-window circuit breaker detects failures in milliseconds and automatically diverts requests to secondary fallback tiers (`gpt-4o` $\to$ `claude-3-5-sonnet` $\to$ self-hosted `llama-3.3-70b`). **Your users experience zero downtime.**
+- **Without Gateway**: When a provider experiences a 503 outage or 429 rate limit spike, your application crashes and your users receive error screens.
+- **With Gateway**: The gateway's sliding-window circuit breaker detects failures in milliseconds and automatically diverts requests to secondary fallback tiers (`gpt-4o` $\to$ `claude-3-5-sonnet` $\to$ self-hosted `llama-3.3-70b`). **Users experience uninterrupted uptime.**
 
 ### 2. Stopping PII Leaks & Credential Sprawl (Security & DLP)
-- **Without Gateway**: Developers copy master API keys into dozens of microservice `.env` files. If an end-user pastes a credit card number, Social Security Number, or private key into a prompt, it gets shipped uninspected to a third-party cloud.
-- **With Gateway**: Master provider credentials are vaulted in the gateway; callers receive restricted, tenant-scoped API keys. The gateway's deterministic DLP engine scans prompts in linear time ($O(n)$ RE2), automatically **masking or blocking** credit cards (with Luhn checksum validation), SSNs, and AWS keys before they leave your network perimeter.
+- **Without Gateway**: Master API keys are distributed across dozens of microservice configuration files. When an end-user pastes an API key, database URL, credit card, or Social Security Number into a prompt, it is transmitted uninspected to external cloud APIs.
+- **With Gateway**: Master provider credentials remain vaulted in the gateway; callers receive restricted, tenant-scoped API keys. The gateway's DLP engine scans prompts in linear time ($O(n)$ RE2), automatically **masking or blocking** credit cards (with Luhn checksum validation), SSNs, private keys, and cloud credentials before they leave your network perimeter.
 
 ### 3. Preventing "Denial of Wallet" & Runaway Bills (Cost Control)
-- **Without Gateway**: A recursive agent enters an infinite loop, or a user runs a batch script that burns through 50 million tokens overnight $\to$ You wake up to an unexpected $25,000 provider invoice.
-- **With Gateway**: The gateway enforces multi-tenant Requests-Per-Minute (RPM) and Tokens-Per-Minute (TPM) budgets using two-phase speculative token reservation. It estimates prompt tokens *before* dispatch and rejects excess traffic with HTTP 429 *before* spending a single dollar upstream.
+- **Without Gateway**: A recursive agent enters an infinite loop, or a user runs a batch script that burns through 50 million tokens overnight, generating massive unexpected cloud invoices.
+- **With Gateway**: The gateway enforces multi-tenant Requests-Per-Minute (RPM) and Tokens-Per-Minute (TPM) budgets using two-phase speculative token reservation. It estimates prompt tokens *before* dispatch and rejects excess traffic with HTTP 429 *before* spending upstream inference budget.
 
 ### 4. Ending "Zombie Token" Spend on Client Disconnects (Efficiency)
-- **Without Gateway**: A user asks a model for a 3,000-token analysis, but closes their browser tab after 2 seconds. The upstream provider keeps generating tokens for the next 20 seconds, billing you for thousands of tokens that nobody will ever read.
-- **With Gateway**: The moment the client drops the TCP socket, the gateway detects the disconnection and **immediately terminates the upstream socket**, stopping token billing on the provider instantly.
+- **Without Gateway**: When a user closes their browser tab or cancels a request 2 seconds into a 3,000-token generation, upstream providers continue generating and billing for tokens that are never read.
+- **With Gateway**: The moment the downstream client disconnects, the gateway cancels the request context and **immediately terminates the upstream socket**, halting billable token generation instantly.
 
 ### 5. Multi-Tenant Cost Attribution & Compliance Auditing (Observability)
-- **Without Gateway**: At the end of the month, finance asks: *"Which team spent $18,000 on AI?"* Nobody knows because every service shares the same API key.
-- **With Gateway**: Every request and token is attributed to a specific tenant ID, team, or cost center. Native Prometheus metrics (`/metrics`) track $p_{99}$ latency and token spend per team in real time, while a **cryptographically chained SHA-256 audit ledger** provides a tamper-evident compliance log without storing raw customer PII.
+- **Without Gateway**: Organizations cannot attribute AI spending accurately across teams or business units because all applications share common API credentials.
+- **With Gateway**: Every request and token is attributed to a specific tenant ID or cost center. Native Prometheus metrics (`/metrics`) track latency and token spend per team in real time, while an append-only **cryptographic SHA-256 audit ledger** provides a tamper-evident compliance record.
 
 ---
 
@@ -92,10 +90,10 @@ flowchart TD
 
 ## Quickstart
 
-### 1. Run with Docker (Recommended)
+### 1. Run with Docker
 
 ```bash
-# Build the minimal production container
+# Build the production container
 docker build -t ai-gateway:latest .
 
 # Run the gateway with default configuration
@@ -106,11 +104,13 @@ docker run -d -p 8080:8080 \
 
 ### 2. Run Native Binary
 
+Requires Go 1.23+:
+
 ```bash
 # Build static binary
 go build -ldflags="-s -w" -o bin/ai-gateway ./cmd/gateway
 
-# Launch with reference configuration
+# Launch with configuration file
 ./bin/ai-gateway -config config.example.yaml
 ```
 
@@ -171,15 +171,44 @@ for chunk in response:
         print(content, end="", flush=True)
 ```
 
+### Using LangChain
+
+```python
+from langchain_openai import ChatOpenAI
+
+llm = ChatOpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="sk-gw-live-analytics-key-4a8f9c",
+    model="gpt-4o"
+)
+
+response = llm.invoke("Hello from LangChain through AI Gateway")
+print(response.content)
+```
+
+### Using Node.js / TypeScript
+
+```typescript
+import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "http://localhost:8080/v1",
+  apiKey: "sk-gw-live-analytics-key-4a8f9c",
+});
+
+const completion = await client.chat.completions.create({
+  model: "gpt-4o",
+  messages: [{ role: "user", content: "Hello world" }],
+});
+```
+
 ---
 
-## Production Capabilities Built Into the Core
-
-The engine is structured as an explicit, high-throughput linear stage pipeline ([ADR-002](file:///root/ai-gateway/docs/adr/ADR-002-proxy-pipeline-architecture.md)):
+## Core Capabilities
 
 ### 1. Ingress & Multi-Tenant Authentication
-- Authenticates callers using constant-time comparison ([`crypto/subtle`](file:///root/ai-gateway/internal/auth/auth.go)) to eliminate timing attacks.
-- Scopes tenants to authorized model routes (`allowed_routes`) and tiers.
+- Authenticates callers using constant-time comparison to eliminate timing attacks.
+- Scopes tenants to authorized model routes (`allowed_routes`), rate limits, and priority tiers.
 - Serves `/healthz/liveness`, `/healthz/readiness`, and tenant-filtered `/v1/models`.
 
 ### 2. SRE Resilience & Health Engine
@@ -188,7 +217,7 @@ The engine is structured as an explicit, high-throughput linear stage pipeline (
 - **Adaptive Full Jitter Retries**: Implements decorrelated jitter backoff and parses `Retry-After` headers.
 - **Readiness Integration**: `/healthz/readiness` dynamically reflects upstream health and circuit breaker states.
 
-### 3. Deterministic Policy & Rate Limiting
+### 3. Policy Enforcement & Rate Limiting
 - **Two-Phase Token Reservation (TPM)**: Pre-dispatch token estimation prevents quota overages before hitting upstreams; post-dispatch reconciliation refunds unused tokens.
 - **Deterministic DLP**: Scans prompts and completions with linear RE2 regex patterns (Credit Cards with Luhn validation, SSNs, AWS Secret Keys, PEM private keys) and Shannon entropy ($H(X) \ge 4.5$).
 - **Streaming Lookahead Buffer**: $128\text{B}$ buffer with $64\text{B}$ overlap catches multi-chunk sensitive patterns in SSE streams.
@@ -198,33 +227,13 @@ The engine is structured as an explicit, high-throughput linear stage pipeline (
   - `ai_gateway_overhead_duration_seconds`: Fine-grained proxy latency histogram ($p_{50} < 2\text{ms}, p_{99} < 15\text{ms}$).
   - `ai_gateway_requests_total`, `ai_gateway_tokens_total`, `ai_gateway_circuit_breaker_state`, `ai_gateway_ratelimit_rejections_total`.
 - **W3C Distributed Tracing**: Generates and propagates `traceparent` headers across downstream responses and upstream dispatches.
-- **Tamper-Evident Audit Ledger**: Hashes all transactions into an unbroken SHA-256 chain ($H_0 = \text{"0"} \times 64$). `VerifyChain` validates log integrity and immediately pinpoints any altered or missing record.
-
----
-
-## Architectural Documentation & ADRs
-
-The system is fully documented with formal specifications and design records:
-
-| Document | Description |
-| :--- | :--- |
-| **[DESIGN.md](file:///root/ai-gateway/DESIGN.md)** | Master technical design document synthesizing the complete architecture and verification evidence. |
-| **[ARCHITECTURE.md](file:///root/ai-gateway/docs/ARCHITECTURE.md)** | Core system topology, 8-stage pipeline, Go interfaces, and canonical domain model definitions. |
-| **[SECURITY-BOUNDARIES.md](file:///root/ai-gateway/docs/SECURITY-BOUNDARIES.md)** | Zero trust boundaries, HKDF tenant isolation, KMS key vaulting, and linear RE2 DLP specifications. |
-| **[THREAT-MODEL.md](file:///root/ai-gateway/docs/THREAT-MODEL.md)** | Formal STRIDE evaluation (19 threat vectors), prompt injection defenses, and denial-of-wallet mitigations. |
-| **[FAILURE-MODES.md](file:///root/ai-gateway/docs/FAILURE-MODES.md)** | Comprehensive FMEA matrix, circuit breaker state machine math, and Full Jitter backoff algorithms. |
-| **[SLO.md](file:///root/ai-gateway/docs/SLO.md)** | Gateway overhead latency budgets, 99.95% availability SLO, multi-window burn rate alerts, and metric catalog. |
-| **[OPERATIONS.md](file:///root/ai-gateway/docs/OPERATIONS.md)** | Production systemd/Kubernetes configurations, zero-downtime rolling deploys, and incident runbooks. |
-| **[ADR-001](file:///root/ai-gateway/docs/adr/ADR-001-language-and-runtime-selection.md)** | Runtime Decision: Go 1.23+ with standard library `net/http` vs Rust, Python, and Envoy. |
-| **[ADR-002](file:///root/ai-gateway/docs/adr/ADR-002-proxy-pipeline-architecture.md)** | Pipeline Pattern: Explicit linear stage machine with zero-copy SSE streaming vs nested middleware. |
-| **[ADR-003](file:///root/ai-gateway/docs/adr/ADR-003-state-and-rate-limiting.md)** | State Management: Sliding-window quotas, two-phase reservation, and fail-secure vs fail-soft defaults. |
-| **[ADR-004](file:///root/ai-gateway/docs/adr/ADR-004-streaming-policy-enforcement.md)** | Streaming DLP: Fixed sliding lookahead buffer ($W=128\text{B}, L=64\text{B}$) vs sentence-boundary stalls. |
+- **Tamper-Evident Audit Ledger**: Hashes all transactions into an unbroken SHA-256 chain ($H_0 = \text{"0"} \times 64$) with built-in chain verification.
 
 ---
 
 ## Configuration Reference
 
-The gateway is configured via a single YAML file supporting environment variable substitution (`${VAR:-default}`). See [`config.example.yaml`](file:///root/ai-gateway/config.example.yaml) for a complete template:
+The gateway is configured via a single YAML file supporting environment variable substitution (`${VAR:-default}`). See [`config.example.yaml`](config.example.yaml) for a complete template:
 
 ```yaml
 server:
@@ -279,11 +288,17 @@ policies:
 
 ## Verification & Testing
 
-The entire system is thoroughly tested with unit, chaos, and integration tests simulating live providers:
+The test suite exercises unit, resilience, rate limiting, DLP, streaming lookahead, Prometheus metrics, and cryptographic ledger verification:
 
 ```bash
-# Run the full test suite with race detector
+# Run the full test suite
 go test -v -count=1 ./...
 ```
 
-**74 total tests pass with 0 failures** across unit, resilience, rate limiting, DLP, streaming lookahead, Prometheus metrics, and cryptographic ledger verification.
+**74 total tests pass with 0 failures.**
+
+---
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

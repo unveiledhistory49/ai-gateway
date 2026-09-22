@@ -13,3 +13,6 @@ cover.out
 
 # Runtime audit logs
 *.jsonl
+
+# Internal documentation
+docs/
