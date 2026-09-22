@@ -27,9 +27,10 @@ type RateLimits struct {
 
 // ChatMessage represents a single message in an OpenAI-compatible chat completion conversation.
 type ChatMessage struct {
-	Role         string `json:"role"`
-	Content      any    `json:"content"` // string or structured multimodal content parts
-	Name         string `json:"name,omitempty"`
+	Role             string `json:"role"`
+	Content          any    `json:"content"` // string or structured multimodal content parts
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Name             string `json:"name,omitempty"`
 	FunctionCall any    `json:"function_call,omitempty"`
 	ToolCalls    any    `json:"tool_calls,omitempty"`
 	ToolCallID   string `json:"tool_call_id,omitempty"`
@@ -59,8 +60,9 @@ type CanonicalChatRequest struct {
 	Tools            any            `json:"tools,omitempty"`
 	ToolChoice       any            `json:"tool_choice,omitempty"`
 	ResponseFormat   any            `json:"response_format,omitempty"`
-	Seed             *int           `json:"seed,omitempty"`
-	StreamOptions    *StreamOptions `json:"stream_options,omitempty"`
+	Seed               *int           `json:"seed,omitempty"`
+	StreamOptions      *StreamOptions `json:"stream_options,omitempty"`
+	ChatTemplateKwargs any            `json:"chat_template_kwargs,omitempty"`
 }
 
 // StreamOptions configures stream behavior such as including usage stats.
@@ -96,9 +98,10 @@ type CanonicalChatResponse struct {
 
 // StreamChoiceDelta holds incremental content deltas in a streaming chunk.
 type StreamChoiceDelta struct {
-	Role      string `json:"role,omitempty"`
-	Content   string `json:"content,omitempty"`
-	ToolCalls any    `json:"tool_calls,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Content          string `json:"content,omitempty"`
+	ReasoningContent string `json:"reasoning_content,omitempty"`
+	ToolCalls        any    `json:"tool_calls,omitempty"`
 }
 
 // StreamChoice represents an individual choice within an SSE chunk.

@@ -196,7 +196,13 @@ func (s *Stage) Execute(reqCtx *pipeline.RequestContext) error {
 			)
 		}
 
-		endpointURL := strings.TrimRight(target.EndpointURL, "/") + "/v1/chat/completions"
+		baseURL := strings.TrimRight(target.EndpointURL, "/")
+		var endpointURL string
+		if strings.HasSuffix(baseURL, "/v1") {
+			endpointURL = baseURL + "/chat/completions"
+		} else {
+			endpointURL = baseURL + "/v1/chat/completions"
+		}
 
 		// If there is another fallback target in the cascade, we attempt the current target once
 		// and failover immediately if it fails with retriable/connection error.
