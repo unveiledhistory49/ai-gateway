@@ -1,7 +1,7 @@
 # AI Gateway
 
 [![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat&logo=go)](https://golang.org)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Tests-74%20Passing-brightgreen.svg)]()
 [![Binary Size](https://img.shields.io/badge/Binary-8.4MB%20(Static)-success.svg)]()
 
