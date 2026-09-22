@@ -13,18 +13,29 @@ Designed as a drop-in replacement for OpenAI API endpoints, it delivers unified 
 
 ---
 
-## Why AI Gateway?
+## The 5 Real-World Problems It Solves
 
-Directly connecting frontend apps, backend microservices, and AI agents to LLM APIs creates operational fragility, security exposure, and unchecked cloud spend. AI Gateway provides a unified, policy-enforcing perimeter:
+Directly connecting applications and agents to LLM APIs creates operational fragility, security exposure, and unchecked cloud spend. AI Gateway provides a unified control plane solving five core operational challenges:
 
-- **Drop-in OpenAI Compatibility**: Works natively with the official OpenAI Python/Node SDKs, LangChain, LlamaIndex, and `curl` by simply pointing `base_url` to the gateway.
-- **Deterministic Data Loss Prevention (DLP)**: Real-time linear-time RE2 regex and Shannon entropy scanners intercept credit cards (Luhn validated), SSNs, AWS keys, and private keys. Configurable `BLOCK` and `MASK` actions prevent data leaks.
-- **Fixed Lookahead Buffer for Streaming SSE**: Zero-copy lookahead buffer ($W=128\text{B}, L=64\text{B}$) intercepts sensitive patterns split across multiple streaming chunks without degrading Time-To-First-Token (TTFT).
-- **Two-Phase Token Reservation & Rate Limiting**: Speculatively reserves tokens before dispatch based on prompt length, reconciling exact usage on completion. Enforces tenant Requests-Per-Minute (RPM), Tokens-Per-Minute (TPM), and concurrency semaphores.
-- **SRE Resilience & Circuit Breaking**: Fast-fails broken upstreams using a sliding-window circuit breaker (`Closed`, `Open`, `Half-Open`) with exponential cooldown doubling and automatic failover across priority tiers (e.g. `gpt-4o` $\to$ `claude-3-5-sonnet` $\to$ on-prem `llama-3.3-70b`).
-- **Instant Zombie Socket Teardown**: When a user or client disconnects mid-stream, the gateway immediately terminates the upstream HTTP connection, ending billable token generation.
-- **Cryptographic Audit Ledger**: Records request/response SHA-256 digests in an append-only, tamper-evident hash-chained ledger ($H_i = \text{SHA-256}(H_{i-1} \parallel \dots)$).
-- **Native Observability**: Exposes Prometheus metrics (`/metrics`) isolating gateway overhead from upstream model duration, alongside W3C `traceparent` distributed tracing.
+### 1. Instant Failover During Provider Outages (Reliability & SRE)
+- **Without Gateway**: OpenAI or Anthropic suffers a 503 outage or 429 rate limit $\to$ Your application crashes, your users get error screens, and revenue stops.
+- **With Gateway**: The gateway's sliding-window circuit breaker detects failures in milliseconds and automatically diverts requests to secondary fallback tiers (`gpt-4o` $\to$ `claude-3-5-sonnet` $\to$ self-hosted `llama-3.3-70b`). **Your users experience zero downtime.**
+
+### 2. Stopping PII Leaks & Credential Sprawl (Security & DLP)
+- **Without Gateway**: Developers copy master API keys into dozens of microservice `.env` files. If an end-user pastes a credit card number, Social Security Number, or private key into a prompt, it gets shipped uninspected to a third-party cloud.
+- **With Gateway**: Master provider credentials are vaulted in the gateway; callers receive restricted, tenant-scoped API keys. The gateway's deterministic DLP engine scans prompts in linear time ($O(n)$ RE2), automatically **masking or blocking** credit cards (with Luhn checksum validation), SSNs, and AWS keys before they leave your network perimeter.
+
+### 3. Preventing "Denial of Wallet" & Runaway Bills (Cost Control)
+- **Without Gateway**: A recursive agent enters an infinite loop, or a user runs a batch script that burns through 50 million tokens overnight $\to$ You wake up to an unexpected $25,000 provider invoice.
+- **With Gateway**: The gateway enforces multi-tenant Requests-Per-Minute (RPM) and Tokens-Per-Minute (TPM) budgets using two-phase speculative token reservation. It estimates prompt tokens *before* dispatch and rejects excess traffic with HTTP 429 *before* spending a single dollar upstream.
+
+### 4. Ending "Zombie Token" Spend on Client Disconnects (Efficiency)
+- **Without Gateway**: A user asks a model for a 3,000-token analysis, but closes their browser tab after 2 seconds. The upstream provider keeps generating tokens for the next 20 seconds, billing you for thousands of tokens that nobody will ever read.
+- **With Gateway**: The moment the client drops the TCP socket, the gateway detects the disconnection and **immediately terminates the upstream socket**, stopping token billing on the provider instantly.
+
+### 5. Multi-Tenant Cost Attribution & Compliance Auditing (Observability)
+- **Without Gateway**: At the end of the month, finance asks: *"Which team spent $18,000 on AI?"* Nobody knows because every service shares the same API key.
+- **With Gateway**: Every request and token is attributed to a specific tenant ID, team, or cost center. Native Prometheus metrics (`/metrics`) track $p_{99}$ latency and token spend per team in real time, while a **cryptographically chained SHA-256 audit ledger** provides a tamper-evident compliance log without storing raw customer PII.
 
 ---
 
