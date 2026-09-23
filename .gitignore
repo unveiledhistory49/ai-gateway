@@ -1,3 +1,13 @@
+# Secrets and environment variables
+.env
+.env.*
+*.env
+!.env.example
+*.key
+*.pem
+*.secret
+credentials.json
+
 # Binaries
 bin/
 *.exe
@@ -16,3 +26,4 @@ cover.out
 
 # Internal documentation
 docs/
+DESIGN.md
